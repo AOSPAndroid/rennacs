@@ -1,0 +1,108 @@
+{% extends "base.html" %}
+{% block title %}Map{% if q %} · {{ q }}{% endif %} — Rennacs{% endblock %}
+{% block body %}
+
+<link rel="stylesheet"
+      href="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.css"
+      crossorigin="anonymous" referrerpolicy="no-referrer">
+<link rel="stylesheet"
+      href="https://cdnjs.cloudflare.com/ajax/libs/leaflet.markercluster/1.5.3/MarkerCluster.css"
+      crossorigin="anonymous" referrerpolicy="no-referrer">
+<link rel="stylesheet"
+      href="https://cdnjs.cloudflare.com/ajax/libs/leaflet.markercluster/1.5.3/MarkerCluster.Default.css"
+      crossorigin="anonymous" referrerpolicy="no-referrer">
+
+<div class="map-head">
+  <h1>Global map</h1>
+  <form class="map-search" action="{{ url_for('map_view') }}" method="get">
+    <input type="text" name="q" value="{{ q|default('') }}"
+           placeholder="Filter the map — e.g. port:443 has_vuln:true country:US"
+           autocomplete="off">
+    <button type="submit">Map it</button>
+  </form>
+</div>
+
+{% if error %}<div class="error-box"><strong>Query error:</strong> {{ error }}</div>{% endif %}
+
+<div class="map-layout">
+  <aside class="map-side">
+    <div class="map-count">
+      <span class="num">{{ data.located|length }}</span> located
+      {% if q %}<span class="muted">for <code>{{ q }}</code></span>{% endif %}
+    </div>
+
+    <h3>Top countries</h3>
+    <table class="facet">
+      {% for c in data.countries %}
+      <tr><td><a href="{{ url_for('map_view', q=(('country:' ~ c.country) if not q else q ~ ' country:' ~ c.country)) }}">{{ c.country }}</a></td>
+          <td class="n">{{ c.n }}</td></tr>
+      {% else %}
+      <tr><td class="muted">no geolocated hosts yet</td></tr>
+      {% endfor %}
+    </table>
+
+    {% if data.located|length == 0 %}
+    <div class="empty-note" style="margin-top:14px">
+      No hosts on the map yet. Geolocate the public hosts in your index with
+      <code>python cli.py geo</code> — private / lab hosts have no public location.
+    </div>
+    {% endif %}
+  </aside>
+
+  <div class="map-main">
+    <div id="map"></div>
+    <div class="map-legend">
+      <span><i class="dot d-ok"></i> open services</span>
+      <span><i class="dot d-vuln"></i> has a flagged service</span>
+      <span class="muted">clustered · click a marker for the host</span>
+    </div>
+  </div>
+</div>
+
+{% if data.ungeolocated %}
+<div class="panel" style="margin-top:18px">
+  <h3>Not geolocated ({{ data.ungeolocated|length }})
+    <span class="muted" style="font-weight:400">— private / lab, or not yet located</span></h3>
+  <div class="port-list">
+    {% for ip in data.ungeolocated[:60] %}
+    <a class="port-pill" href="{{ url_for('host', ip=ip) }}">{{ ip }}</a>
+    {% endfor %}
+    {% if data.ungeolocated|length > 60 %}<span class="muted">+{{ data.ungeolocated|length - 60 }} more</span>{% endif %}
+  </div>
+</div>
+{% endif %}
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.js"
+        crossorigin="anonymous" referrerpolicy="no-referrer"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/leaflet.markercluster/1.5.3/leaflet.markercluster.js"
+        crossorigin="anonymous" referrerpolicy="no-referrer"></script>
+<script>
+  const DATA = {{ data.located | tojson }};
+  const map = L.map('map', { worldCopyJump: true }).setView([20, 0], 2);
+  L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png', {
+    attribution: '&copy; OpenStreetMap contributors', maxZoom: 19,
+  }).addTo(map);
+
+  const cluster = L.markerClusterGroup({ maxClusterRadius: 45, chunkedLoading: true });
+  const pts = [];
+  for (const h of DATA) {
+    if (h.lat == null || h.lon == null) continue;
+    const vuln = h.vulns > 0;
+    const m = L.circleMarker([h.lat, h.lon], {
+      radius: 6, weight: 2,
+      color: vuln ? '#e8502e' : '#f0864f',
+      fillColor: vuln ? '#e8502e' : '#f0864f', fillOpacity: 0.6,
+    });
+    const loc = [h.city, h.country].filter(Boolean).join(', ');
+    m.bindPopup(
+      `<b><a href="/host/${h.ip}">${h.ip}</a></b><br>${h.org || ''}<br>${loc}<br>` +
+      `${h.ports} open port(s)` + (vuln ? ` · <b style="color:#e8502e">${h.vulns} flagged</b>` : '')
+    );
+    cluster.addLayer(m);
+    pts.push([h.lat, h.lon]);
+  }
+  map.addLayer(cluster);
+  if (pts.length) map.fitBounds(pts, { padding: [40, 40], maxZoom: 8 });
+</script>
+
+{% endblock %}

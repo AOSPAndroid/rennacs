@@ -1,0 +1,104 @@
+{% extends "base.html" %}
+{% block title %}{{ ip }} — Rennacs{% endblock %}
+{% block body %}
+
+{% if not doc %}
+<div class="empty-note">
+  <h2>{{ ip }}</h2>
+  Nothing indexed for this host. Scan it with
+  <code>python cli.py scan {{ ip }}</code>.
+</div>
+{% else %}
+
+<div class="host-head">
+  <h1>{{ doc.ip }}</h1>
+  <a class="raw-link" href="{{ url_for('api_host', ip=doc.ip) }}">view raw JSON</a>
+</div>
+{% if doc.tags %}
+<div class="host-tags">
+  {% for t in doc.tags %}<a class="tag idb-tag" href="{{ url_for('search', q='tag:' ~ t) }}">{{ t }}</a>{% endfor %}
+</div>
+{% endif %}
+
+<section class="host-grid">
+  <div class="host-info">
+    <h3>General Information</h3>
+    <table class="kv">
+      {% if doc.hostnames %}<tr><th>Hostnames</th><td>{{ doc.hostnames|join(', ') }}</td></tr>{% endif %}
+      {% if doc.country %}<tr><th>Country</th><td>{{ doc.country }}</td></tr>{% endif %}
+      {% if doc.city %}<tr><th>City</th><td>{{ doc.city }}</td></tr>{% endif %}
+      {% if doc.org %}<tr><th>Organization</th><td>{{ doc.org }}</td></tr>{% endif %}
+      {% if doc.asn %}<tr><th>ASN</th><td>{{ doc.asn }}</td></tr>{% endif %}
+      <tr><th>Open ports</th><td>{{ doc.services|length }}</td></tr>
+      <tr><th>Last seen</th><td>{{ doc.seen_at[:19]|replace('T', ' ') }}</td></tr>
+    </table>
+  </div>
+
+  <div class="host-ports">
+    <h3>Open Ports</h3>
+    <div class="port-list">
+      {% for s in doc.services %}
+      <a class="port-pill" href="#port-{{ s.port }}">{{ s.port }}</a>
+      {% endfor %}
+    </div>
+  </div>
+</section>
+
+<section class="services">
+  {% for s in doc.services %}
+  <article class="svc-card" id="port-{{ s.port }}">
+    <header class="svc-head">
+      <span class="svc-port">{{ s.port }} / {{ s.transport|upper }}</span>
+      {% if s.product %}<span class="tag prod">{{ s.product }}{% if s.version %} {{ s.version }}{% endif %}</span>
+      {% elif s.service %}<span class="tag svc">{{ s.service }}</span>{% endif %}
+      {% if s.has_ssl %}<span class="tag ssl">SSL</span>{% endif %}
+      {% if s.os %}<span class="tag os">{{ s.os }}</span>{% endif %}
+      {% for v in s.vulns %}<span class="tag vuln sev-{{ v.severity }}">{{ v.cve }}</span>{% endfor %}
+      <span class="svc-seen">{{ s.seen_at[:19]|replace('T', ' ') }}</span>
+    </header>
+    {% if s.vulns %}
+    <div class="vuln-box">
+      <strong>⚠ Possible vulnerabilities</strong>
+      <span class="vuln-note">heuristic version match — verify before acting</span>
+      <ul>
+        {% for v in s.vulns %}
+        <li>
+          <div class="vuln-line">
+            <span class="sev-dot sev-{{ v.severity }}"></span>
+            <a href="{{ url_for('search', q='vuln:' ~ v.cve) }}">{{ v.cve }}</a>
+            {% if v.cvss is defined and v.cvss is not none %}
+              <span class="cvss-chip sev-{{ v.severity }}">CVSS {{ v.cvss }}</span>
+            {% else %}
+              <span class="sev-label">{{ v.severity }}</span>
+            {% endif %}
+            {% if v.kev %}<span class="tag vuln kev-badge" title="CISA Known Exploited Vulnerability">KEV · exploited</span>{% endif %}
+            {% if v.confirmed == 'yes' %}<span class="confirm ok" title="detected version falls in cve.now's affected range">✓ in affected range</span>
+            {% elif v.confirmed == 'no' %}<span class="confirm no" title="detected version is outside cve.now's affected range">version may be patched</span>{% endif %}
+            {% if v.enriched and v.url %}<a class="src" href="{{ v.url }}" target="_blank" rel="noopener">cve.now ↗</a>{% endif %}
+          </div>
+          <div class="vuln-summary">{{ v.summary }}</div>
+          {% if v.vector %}<div class="vuln-vector">{{ v.vector }}</div>{% endif %}
+        </li>
+        {% endfor %}
+      </ul>
+      {% if s.vulns | selectattr('enriched') | list %}
+      <div class="vuln-src-note">Severity, KEV status and affected ranges from
+        <a href="https://cve.now" target="_blank" rel="noopener">cve.now</a>.</div>
+      {% endif %}
+    </div>
+    {% endif %}
+    {% if s.has_ssl and (s.ssl_cn or s.ssl_issuer) %}
+    <div class="ssl-box">
+      <strong>SSL Certificate</strong>
+      {% if s.ssl_cn %}<span>Subject CN: {{ s.ssl_cn }}</span>{% endif %}
+      {% if s.ssl_issuer %}<span>Issuer: {{ s.ssl_issuer }}</span>{% endif %}
+    </div>
+    {% endif %}
+    {% if s.banner %}<pre class="banner full">{{ s.banner }}</pre>
+    {% else %}<p class="muted">(open, no banner captured)</p>{% endif %}
+  </article>
+  {% endfor %}
+</section>
+
+{% endif %}
+{% endblock %}

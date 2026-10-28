@@ -1,0 +1,159 @@
+{% extends "base.html" %}
+{% block title %}Rennacs — device search engine{% endblock %}
+{% block body %}
+
+<section class="hero">
+  <h1>Search engine for devices on networks you control</h1>
+  <p class="sub">
+    A self-hosted, educational re-creation of Shodan. Sweep whole networks you're
+    authorized for, index the banners continuously, and search them with a filter
+    query language.
+  </p>
+</section>
+
+<section class="stats-grid">
+  <div class="stat">
+    <div class="num">{{ stats.hosts }}</div><div class="lbl">hosts indexed</div>
+  </div>
+  <div class="stat">
+    <div class="num">{{ stats.services }}</div><div class="lbl">open services</div>
+  </div>
+  <div class="stat">
+    <div class="num">{{ stats.top_products|length }}</div><div class="lbl">products seen</div>
+  </div>
+  <div class="stat {{ 'stat-alert' if stats.vuln_services else '' }}">
+    <div class="num">{{ stats.vuln_services }}</div><div class="lbl">flagged services</div>
+  </div>
+  {% if stats.kev_services %}
+  <div class="stat stat-kev">
+    <div class="num">{{ stats.kev_services }}</div><div class="lbl">known exploited</div>
+  </div>
+  {% endif %}
+</section>
+
+{% if stats.hosts == 0 %}
+<div class="empty-note">
+  The index is empty. Load the demo dataset with <code>python demo_seed.py</code>,
+  or scan your own machine with <code>python cli.py scan 127.0.0.1</code>.
+</div>
+{% endif %}
+
+<section class="panels">
+  <div class="panel">
+    <h3>Try a query</h3>
+    <ul class="examples">
+      {% for q, desc in examples %}
+      <li><a href="{{ url_for('search', q=q) }}"><code>{{ q }}</code></a>
+          <span class="desc">{{ desc }}</span></li>
+      {% endfor %}
+    </ul>
+  </div>
+
+  <div class="panel">
+    <h3>Top ports</h3>
+    <table class="facet">
+      {% for p in stats.top_ports %}
+      <tr><td><a href="{{ url_for('search', q='port:' ~ p.port) }}">{{ p.port }}</a></td>
+          <td class="bar-cell">
+            <span class="bar" style="width: {{ (p.n / (stats.top_ports[0].n or 1) * 100)|round }}%"></span>
+          </td>
+          <td class="n">{{ p.n }}</td></tr>
+      {% endfor %}
+    </table>
+  </div>
+
+  <div class="panel">
+    <h3>Top products</h3>
+    <table class="facet">
+      {% for p in stats.top_products %}
+      <tr><td><a href="{{ url_for('search', q='product:' ~ p.product) }}">{{ p.product }}</a></td>
+          <td class="n">{{ p.n }}</td></tr>
+      {% else %}
+      <tr><td class="muted">no fingerprints yet</td></tr>
+      {% endfor %}
+    </table>
+  </div>
+
+  <div class="panel">
+    <h3>Top countries</h3>
+    <table class="facet">
+      {% for c in stats.top_countries %}
+      <tr><td><a href="{{ url_for('search', q='country:' ~ c.country) }}">{{ c.country }}</a></td>
+          <td class="n">{{ c.n }}</td></tr>
+      {% else %}
+      <tr><td class="muted">private / lab hosts only</td></tr>
+      {% endfor %}
+    </table>
+  </div>
+
+  <div class="panel">
+    <h3>Top vulnerabilities <span class="muted" style="font-weight:400">(heuristic)</span></h3>
+    <table class="facet">
+      {% for v in stats.top_vulns %}
+      <tr><td><a href="{{ url_for('search', q='vuln:' ~ v.cve) }}">{{ v.cve }}</a></td>
+          <td class="n">{{ v.n }}</td></tr>
+      {% else %}
+      <tr><td class="muted">none flagged</td></tr>
+      {% endfor %}
+    </table>
+  </div>
+</section>
+
+<section class="crawl-section">
+  <div class="cve-feed-head">
+    <h3>Crawler activity</h3>
+    <span class="catalog-line">most recent sweeps · <code>python cli.py sweep &lt;cidr&gt;</code></span>
+  </div>
+  {% if jobs %}
+  <div class="cve-feed">
+    {% for j in jobs %}
+    <div class="cve-row job-row">
+      <span class="job-status job-{{ j.status }}">{{ j.status }}</span>
+      <span class="cve-id">{{ j.scope }}</span>
+      <span class="job-prog">{{ j.scanned }}/{{ j.total }} hosts</span>
+      <span class="job-up">{{ j.hosts_up }} up · {{ j.services }} svc</span>
+      <span class="cve-title">{{ (j.finished_at or j.updated_at or '')[:19]|replace('T',' ') }}</span>
+    </div>
+    {% endfor %}
+  </div>
+  {% else %}
+  <div class="empty-note">
+    No sweeps yet. Crawl a whole network you control with
+    <code>python cli.py sweep 192.168.0.0/16 -p top20</code> — or run it continuously
+    with <code>--repeat 0 --interval 600</code>.
+  </div>
+  {% endif %}
+</section>
+
+<section class="cve-feed-section">
+  <div class="cve-feed-head">
+    <h3>Latest critical vulnerabilities
+      <a class="src" href="https://cve.now" target="_blank" rel="noopener">cve.now ↗</a></h3>
+    {% if catalog.vulnerabilitiesTracked %}
+    <span class="catalog-line">
+      {{ "{:,}".format(catalog.vulnerabilitiesTracked) }} tracked
+      {% if catalog.criticalThisWeek %} · {{ catalog.criticalThisWeek }} critical this week{% endif %}
+      {% if feed_at %} · updated {{ feed_at[:10] }}{% endif %}
+    </span>
+    {% endif %}
+  </div>
+  {% if cve_feed %}
+  <div class="cve-feed">
+    {% for v in cve_feed %}
+    <a class="cve-row" href="{{ v.url }}" target="_blank" rel="noopener">
+      <span class="cve-id">{{ v.cve }}</span>
+      {% if v.cvss is not none %}<span class="cve-score sev-{{ v.severity }}">{{ v.cvss }}</span>{% endif %}
+      {% if v.kev %}<span class="tag vuln kev-badge">KEV</span>{% endif %}
+      <span class="cve-title">{{ v.title }}</span>
+    </a>
+    {% endfor %}
+  </div>
+  {% else %}
+  <div class="empty-note">
+    No cve.now data cached yet. Run <code>python cli.py enrich</code> to pull the latest
+    critical CVEs and enrich your scanned hosts with real CVSS scores and CISA-KEV flags.
+  </div>
+  {% endif %}
+</section>
+
+{% endblock %}
