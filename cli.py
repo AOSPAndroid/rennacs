@@ -21,6 +21,7 @@ import argparse
 import asyncio
 import ipaddress
 import json
+import math
 import random
 import sys
 import time
@@ -266,6 +267,94 @@ def cmd_findings(args) -> int:
             print(f"  {finding['ip']}:{finding['port']}/{finding['transport']} "
                   f"potential / low confidence  {cves}")
     return 0
+
+
+def cmd_catalog(args) -> int:
+    """Explicit catalog operations; local reads never contact the source."""
+    from rennacs.catalog import Catalog, valid_id
+
+    try:
+        if args.catalog_cmd in {"sync", "fetch"}:
+            if (args.max_requests < 1 or not math.isfinite(args.rate) or args.rate <= 0
+                    or (args.catalog_cmd == "sync" and args.max_pages < 1)):
+                raise ValueError("page/request budgets and finite rate must be positive")
+        if args.catalog_cmd == "fetch":
+            for identifier in args.ids:
+                if not valid_id(identifier):  # Never strip or repair source tokens.
+                    raise ValueError("invalid advisory ID")
+    except ValueError as exc:
+        print(f"catalog error: {exc}", file=sys.stderr)
+        return 2
+    catalog = Catalog(args.db)
+    rc = 0
+    try:
+        if args.catalog_cmd == "sync":
+            data = catalog.sync(max_pages=args.max_pages, max_requests=args.max_requests,
+                                rate=args.rate, restart=args.restart)
+        elif args.catalog_cmd == "fetch":
+            data = catalog.fetch_ids(args.ids, max_requests=args.max_requests, rate=args.rate)
+        else:
+            data = catalog.status()
+        if args.catalog_cmd in {"sync", "fetch"} and data['stop_reason'] == 'error':
+            rc = 1
+    except KeyboardInterrupt:
+        rc = 130
+        data = {"interrupted": True, "complete": False, "stop_reason": "interrupted",
+                "status": catalog.status()}
+    finally:
+        catalog.close()
+    if args.json:
+        print(json.dumps(data, indent=2))
+    else:
+        state = data.get("status", data)
+        if data.get("interrupted"):
+            print("Interrupted; this batch is incomplete. Resume the explicit CLI operation.")
+        elif args.catalog_cmd in {"sync", "fetch"}:
+            print(f"Requests: {data['requests']}; pages: {data['pages']}; "
+                  f"stored: {data['stored']}; stopped: {data['stop_reason']}")
+        print(f"Local advisory catalog ({state['source']}): {state['traversal']}")
+        print(f"Stored details: {state['stored_details']}; pending: {state['pending_details']}")
+        print(f"Listing exhausted: {state['listing_exhausted']}; traversal complete: {state['complete']}")
+        print("Coverage describes a traversal, not an atomic snapshot or proof of asset security.")
+        if state['last_error']:
+            print(f"Last catalog error: {state['last_error']['message']}", file=sys.stderr)
+    return rc
+
+
+def cmd_catalog_assess(args) -> int:
+    """Reassess one keyset page of recorded services without network probes."""
+    try:
+        if not 1 <= args.limit <= 10000 or args.after_id < 0:
+            raise ValueError("limit must be 1..10000 and after-id nonnegative")
+        compile_query(args.query)
+    except (ValueError, QueryError) as exc:
+        print(f"catalog assessment error: {exc}", file=sys.stderr)
+        return 2
+    idx = Index(args.db)
+    interrupted = False
+    try:
+        data = idx.reassess_catalog(args.query, limit=args.limit, after_id=args.after_id)
+    except KeyboardInterrupt:
+        interrupted = True
+        # Replaying the original page is safe; never guess the last committed service.
+        data = {"interrupted": True, "after_id": args.after_id, "has_more": True}
+    finally:
+        idx.close()
+    if args.json:
+        print(json.dumps(data, indent=2))
+    elif interrupted:
+        print(f"Interrupted; replay this page with the same query and --after-id {args.after_id}.")
+    else:
+        print(f"Offline catalog reassessment: {data['processed']} service(s); "
+              f"{data['matched_services']} matched; {data['advisory_matches']} advisory match(es).")
+        print(f"catalog revision: {data['catalog_revision']}; after_id: {data['after_id']}; "
+              f"has_more: {data['has_more']}")
+        if data['has_more']:
+            print(f"Partial pass. Continue with the same database/query and --after-id {data['after_id']}.")
+        else:
+            print("Selected service traversal exhausted at this point; not proof of security.")
+        print("Keyset progress is not a snapshot; avoid concurrent scans/catalog changes during a pass.")
+    return 130 if interrupted else 0
 
 
 def cmd_search(args) -> int:
@@ -519,6 +608,31 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--offset", type=int, default=0)
     p.add_argument("--json", action="store_true", help="machine-readable local report")
     p.set_defaults(func=cmd_findings)
+
+    p = sub.add_parser("catalog", help="local advisory catalog and offline reassessment")
+    catalog_sub = p.add_subparsers(dest="catalog_cmd", required=True)
+    p = catalog_sub.add_parser("status", help="offline local coverage status")
+    p.add_argument("--json", action="store_true")
+    p.set_defaults(func=cmd_catalog)
+    p = catalog_sub.add_parser("sync", help="explicit bounded, resumable source traversal")
+    p.add_argument("--max-pages", type=int, default=1)
+    p.add_argument("--max-requests", type=int, default=50)
+    p.add_argument("--rate", type=float, default=1.0)
+    p.add_argument("--restart", action="store_true")
+    p.add_argument("--json", action="store_true")
+    p.set_defaults(func=cmd_catalog)
+    p = catalog_sub.add_parser("fetch", help="fetch explicit advisory IDs, not full coverage")
+    p.add_argument("ids", nargs="*", help="exact source IDs; omit to resume pending targeted details")
+    p.add_argument("--max-requests", type=int, default=50)
+    p.add_argument("--rate", type=float, default=1.0)
+    p.add_argument("--json", action="store_true")
+    p.set_defaults(func=cmd_catalog)
+    p = catalog_sub.add_parser("assess", help="offline reassessment of one service keyset page")
+    p.add_argument("query", nargs="?", default="")
+    p.add_argument("--limit", type=int, default=1000)
+    p.add_argument("--after-id", type=int, default=0)
+    p.add_argument("--json", action="store_true")
+    p.set_defaults(func=cmd_catalog_assess)
 
     p = sub.add_parser("search", help="query the index from the terminal")
     p.add_argument("query", nargs="?", default="", help="filter query string")

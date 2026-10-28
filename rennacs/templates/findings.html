@@ -9,6 +9,20 @@ A reported version is not proof of exposure; distribution backports and configur
   <button type="submit">Filter findings</button>
 </form>
 {% if error %}<div class="empty-note">Query error: {{ error }}</div>{% endif %}
+{% if data.catalog %}
+<section class="empty-note" aria-label="Catalog coverage">
+  <h2>Catalog coverage</h2>
+  <p>Source: {{ data.catalog.source }} · traversal: {{ data.catalog.traversal }} ·
+    stored details: {{ data.catalog.stored_details }} · pending details: {{ data.catalog.pending_details }}.</p>
+  <p>Listing exhausted: {{ data.catalog.listing_exhausted }} · traversal complete: {{ data.catalog.complete }}.
+    This is not an atomic snapshot, a complete vulnerability assessment or proof of asset security.</p>
+  <p>Traversal started: {{ data.catalog.started_at or 'not started' }} ·
+    last catalog progress: {{ data.catalog.updated_at or 'never' }}.
+    <a href="{{ url_for('api_catalog') }}">Local catalog status JSON</a></p>
+  {% if data.catalog.last_error %}<p>Last catalog error: {{ data.catalog.last_error.message }}</p>{% endif %}
+  <p>Page views never sync or reassess. Use the explicit catalog CLI to update local evidence.</p>
+</section>
+{% endif %}
 <p>{{ data.total }} service assessment(s). <a href="{{ url_for('api_findings', q=q) }}">JSON report</a></p>
 {% for f in data.matches %}
 <article class="svc-card">
@@ -19,9 +33,17 @@ A reported version is not proof of exposure; distribution backports and configur
   </header>
   <div class="vuln-box">
     <p>Observed: {{ f.evidence.observed_at }}. No exploit test performed.</p>
+    <p>Catalog assessed: {{ f.evidence.catalog_checked_at or 'never' }} · revision {{ f.evidence.catalog_revision }}.
+      Assessment time is not a new network observation; later catalog updates require reassessment.</p>
     <ul>{% for v in f.advisories %}
       <li><a href="{{ v.reference }}" target="_blank" rel="noopener noreferrer">{{ v.cve }}</a>
-        — {{ v.summary }}{% if v.known_exploited_catalog %} · in known-exploited catalog (not proof about this host){% endif %}</li>
+        — {{ v.summary }}{% if v.known_exploited_catalog %} · in known-exploited catalog (not proof about this host){% endif %}
+        <p>Source: {{ v.source }} · Range match: {{ v.match_status }} (potential only) ·
+          method: {{ v.detection_method }}{% if v.catalog_id %} · catalog ID: {{ v.catalog_id }}{% endif %}.</p>
+        {% if v.fixed_versions %}<p>Source-reported fixed versions: {{ v.fixed_versions | join(', ') }}.
+          Check the installed package, distribution backports and vendor prerequisites; this does not prove a fix on this host.</p>{% endif %}
+        <p class="muted">Summary origin: {{ v.summary_origin }}.</p>
+      </li>
     {% endfor %}</ul>
     <strong>Owner approval required</strong>
     <ol>{% for step in f.remediation.steps %}<li>{{ step }}</li>{% endfor %}</ol>

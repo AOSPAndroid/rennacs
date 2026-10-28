@@ -8,6 +8,8 @@ from __future__ import annotations
 import hashlib
 import re
 
+from .catalog import valid_id
+
 _CVE = re.compile(r"CVE-\d{4}-\d{4,}\Z", re.ASCII)
 
 
@@ -21,16 +23,30 @@ def assess_service(row: dict) -> dict:
         if not isinstance(vuln, dict):
             continue
         cve = vuln.get("cve", "")
-        if not isinstance(cve, str) or not _CVE.fullmatch(cve):
+        if not valid_id(cve):
             continue
+        catalog_backed = vuln.get("source") == "cve.now-catalog"
         advisories.append({
             "cve": cve,
             "severity": vuln.get("severity", "unknown"),
             "summary": str(vuln.get("summary") or "")[:2000],
             "cvss": vuln.get("cvss"),
             "known_exploited_catalog": bool(vuln.get("kev")),
-            "reference": f"https://www.cve.org/CVERecord?id={cve}",
-            "metadata_enriched": bool(vuln.get("enriched")),
+            "reference": (f"https://cve.now/{cve}" if catalog_backed or not _CVE.fullmatch(cve)
+                          else f"https://www.cve.org/CVERecord?id={cve}"),
+            "metadata_enriched": bool(vuln.get("enriched")) or catalog_backed,
+            "source": vuln.get("source") or "legacy_or_imported",
+            "catalog_id": vuln.get("catalog_id") if catalog_backed else None,
+            "catalog_provenance": vuln.get("catalog_provenance") if catalog_backed else None,
+            "detection_method": vuln.get("detection_method") or "reported_cve",
+            "match_status": vuln.get("match_status", "unknown"),
+            "matched_affected": vuln.get("matched_affected", []) if catalog_backed else [],
+            "fixed_versions": vuln.get("fixed_versions", []) if catalog_backed else [],
+            "summary_origin": vuln.get("summary_origin", "unspecified"),
+            "summary_provenance": vuln.get("summary_provenance", {"kind": "unspecified"}),
+            "sources": vuln.get("sources", []),
+            "limitations": vuln.get("limitations", []),
+            "correlation_sources": vuln.get("correlation_sources", [vuln.get("source") or "legacy_or_imported"]),
             # Historical 'confirmed' means only version-range membership.
             "version_range_match": vuln.get("confirmed", "unknown"),
         })
@@ -52,6 +68,8 @@ def assess_service(row: dict) -> dict:
         },
         "evidence": {
             "observed_at": row.get("seen_at"),
+            "catalog_checked_at": row.get("catalog_checked_at"),
+            "catalog_revision": row.get("catalog_revision", 0),
             "product": row.get("product") or "",
             "version": row.get("version") or "",
             "service": row.get("service") or "",
@@ -87,5 +105,6 @@ def report(index, query: str = "", *, limit: int = 100, offset: int = 0) -> dict
     return {
         "query": query, "unit": "service_assessments", "total": total,
         "count": len(matches), "offset": offset, "matches": matches,
+        "catalog": index.catalog.status(),
         "notice": "Potential findings only; no exploit verification or remediation performed.",
     }

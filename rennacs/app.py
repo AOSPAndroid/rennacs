@@ -128,6 +128,15 @@ def create_app(db_path: str | None = None) -> Flask:
             idx.close()
         return render_template("findings.html", q=q, data=data, error=error, page=page)
 
+    @app.get("/api/catalog")
+    def api_catalog():
+        """Local coverage metadata only; no web-triggered catalog acquisition."""
+        idx = index()
+        try:
+            return jsonify(idx.catalog.status())
+        finally:
+            idx.close()
+
     @app.route("/api/findings")
     def api_findings():
         from .findings import report

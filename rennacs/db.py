@@ -15,6 +15,8 @@ from __future__ import annotations
 
 import json
 import sqlite3
+from collections import OrderedDict
+from copy import deepcopy
 from contextlib import contextmanager
 from dataclasses import asdict
 from datetime import datetime, timezone
@@ -51,6 +53,9 @@ CREATE TABLE IF NOT EXISTS services (
     ssl_trust   TEXT DEFAULT 'not_observed',
     banner      TEXT,
     vulns       TEXT,          -- json list of {cve, severity, summary, ...enrichment}
+    catalog_vulns TEXT DEFAULT '[]', -- separately refreshable catalog correlations
+    catalog_checked_at TEXT,
+    catalog_revision INTEGER DEFAULT 0,
     vuln_ids    TEXT,          -- space-joined CVE ids, for vuln:/has_vuln: filters
     kev         INTEGER DEFAULT 0,  -- 1 if any vuln is a CISA Known-Exploited (cve.now)
     search_text TEXT,          -- lower-cased blob for free-text matching
@@ -110,6 +115,32 @@ def ip_to_int(ip: str) -> int | None:
     return int(addr) if addr.version == 4 else None
 
 
+def _merge_advisories(legacy: list, catalog: list) -> list[dict]:
+    """Prefer catalog metadata, but retain positive KEV evidence from either source."""
+    merged = {item["cve"]: dict(item) for item in legacy}
+    for item in catalog:
+        old = merged.get(item["cve"])
+        value = dict(item)
+        if old is not None:
+            value = {**old, **value}
+            value["kev"] = bool(old.get("kev") or item.get("kev"))
+            value["correlation_sources"] = list(dict.fromkeys([
+                old.get("source") or "legacy_or_imported",
+                item.get("source") or "cve.now-catalog",
+            ]))
+        merged[item["cve"]] = value
+    return list(merged.values())
+
+
+def _service_doc(row) -> dict:
+    doc = dict(row)
+    legacy = json.loads(doc.get("vulns") or "[]")
+    doc["catalog_vulns"] = json.loads(doc.get("catalog_vulns") or "[]")
+    doc["vulns"] = _merge_advisories(legacy, doc["catalog_vulns"])
+    doc["ssl_sans"] = json.loads(doc.get("ssl_sans") or "[]")
+    return doc
+
+
 class Index:
     def __init__(self, path: str = "rennacs.db"):
         self.path = path
@@ -119,7 +150,12 @@ class Index:
         self.conn.executescript(SCHEMA)
         self._migrate()                     # add any columns an old DB is missing
         self.conn.executescript(INDEXES)    # then index them
+        # Establish catalog tables before any caller-owned transaction can begin.
+        from .catalog import Catalog
+        self._catalog = Catalog(connection=self.conn)
         self.conn.commit()
+        self._match_cache = OrderedDict()
+        self._match_revision = None
 
     def _migrate(self) -> None:
         """Add columns that newer versions introduced to an older database file.
@@ -132,7 +168,10 @@ class Index:
         for name, ddl in (("ip_int", "INTEGER"), ("vulns", "TEXT"),
                           ("vuln_ids", "TEXT"), ("kev", "INTEGER DEFAULT 0"),
                           ("ssl_sans", "TEXT DEFAULT '[]'"),
-                          ("ssl_trust", "TEXT DEFAULT 'not_observed'")):
+                          ("ssl_trust", "TEXT DEFAULT 'not_observed'"),
+                          ("catalog_vulns", "TEXT DEFAULT '[]'"),
+                          ("catalog_checked_at", "TEXT"),
+                          ("catalog_revision", "INTEGER DEFAULT 0")):
             if name not in have:
                 self.conn.execute(f"ALTER TABLE services ADD COLUMN {name} {ddl}")
         have_h = {r["name"] for r in self.conn.execute("PRAGMA table_info(hosts)")}
@@ -145,6 +184,39 @@ class Index:
 
     def close(self) -> None:
         self.conn.close()
+
+    @property
+    def catalog(self):
+        """Borrow this connection; matching never contacts the advisory source."""
+        if self._catalog is None:
+            from .catalog import Catalog
+            self._catalog = Catalog(connection=self.conn)
+        return self._catalog
+
+    def _catalog_matches(self, product: str, version: str, *, revision: int) -> list[dict]:
+        from .matching import product_keys, match_advisory
+
+        if revision != self._match_revision:
+            self._match_cache.clear()
+            self._match_revision = revision
+        key = (product or "", version or "")
+        cacheable = not self.conn.in_transaction
+        if not cacheable or key not in self._match_cache:
+            matches = [match_advisory(key[0], key[1], raw)
+                       for raw in self.catalog.candidates(product_keys(key[0]))]
+            for item in matches:
+                if item is not None:
+                    item["catalog_provenance"] = self.catalog.provenance(item["catalog_id"])
+            matches = [item for item in matches if item is not None]
+            # A caller rollback (including to a savepoint) can reuse this revision.
+            # Never read or retain cached matches for speculative catalog state.
+            if not cacheable:
+                return matches
+            self._match_cache[key] = matches
+            if len(self._match_cache) > 1024:
+                self._match_cache.popitem(last=False)
+        self._match_cache.move_to_end(key)
+        return deepcopy(self._match_cache[key])
 
     @contextmanager
     def _tx(self):
@@ -168,6 +240,10 @@ class Index:
         ).fetchone():
             return  # do not store billions of empty/unknown address documents
         geo = enrich(host.ip)
+        revision = self.catalog.revision()
+        matches = [self._catalog_matches(s.product, s.version, revision=revision)
+                   for s in host.services]
+        checked_at = datetime.now(timezone.utc).isoformat()
         with self._tx():
             previous = self.conn.execute(
                 "SELECT * FROM services WHERE ip=?", (host.ip,)
@@ -208,8 +284,9 @@ class Index:
                      if old["transport"] == "tcp" and old["port"] in touched),
                 )
             ip_int = ip_to_int(host.ip)
-            for s in host.services:
-                vuln_ids = " ".join(v["cve"] for v in s.vulns)
+            for s, catalog_matches in zip(host.services, matches):
+                merged = _merge_advisories(s.vulns, catalog_matches)
+                vuln_ids = " ".join(v["cve"] for v in merged)
                 search = " ".join(filter(None, [
                     s.banner, s.product, s.version, s.service, s.os, s.ssl_cn,
                     s.ssl_issuer, geo.org, geo.country, geo.city, vuln_ids,
@@ -217,12 +294,15 @@ class Index:
                 self.conn.execute(
                     """INSERT INTO services(ip, ip_int, port, transport, service,
                            product, version, os, has_ssl, ssl_cn, ssl_issuer, banner,
-                           vulns, vuln_ids, search_text, seen_at, ssl_sans, ssl_trust)
-                       VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                           vulns, vuln_ids, search_text, seen_at, ssl_sans, ssl_trust,
+                           catalog_vulns, catalog_checked_at, catalog_revision, kev)
+                       VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                     (host.ip, ip_int, s.port, s.transport, s.service, s.product,
                      s.version, s.os, 1 if s.has_ssl else 0, s.ssl_cn, s.ssl_issuer,
                      s.banner, json.dumps(s.vulns), vuln_ids, search, s.seen_at,
-                     json.dumps(s.ssl_sans), "unverified" if s.has_ssl else "not_observed"),
+                     json.dumps(s.ssl_sans), "unverified" if s.has_ssl else "not_observed",
+                     json.dumps(catalog_matches), checked_at, revision,
+                     int(any(v.get("kev") for v in merged))),
                 )
                 self.conn.execute(
                     """INSERT INTO service_observations
@@ -256,6 +336,11 @@ class Index:
         lon = doc.get("lon", geo.lon)
         tags = doc.get("tags", [])
         tag_text = " ".join(tags)
+        revision = self.catalog.revision()
+        services = doc.get("services", [])
+        matches = [self._catalog_matches(s.get("product", ""), s.get("version", ""),
+                                         revision=revision) for s in services]
+        checked_at = datetime.now(timezone.utc).isoformat()
         with self._tx():
             self.conn.execute(
                 """INSERT INTO hosts(ip, hostnames, country, city, org, asn,
@@ -273,13 +358,14 @@ class Index:
             )
             self.conn.execute("DELETE FROM services WHERE ip=?", (doc["ip"],))
             ip_int = ip_to_int(doc["ip"])
-            for s in doc.get("services", []):
+            for s, catalog_matches in zip(services, matches):
                 vulns = s.get("vulns")
                 if vulns is None:
                     vulns = [v.as_dict()
                              for v in vulncheck(s.get("product", ""),
                                                 s.get("version", ""))]
-                vuln_ids = " ".join(v["cve"] for v in vulns)
+                merged = _merge_advisories(vulns, catalog_matches)
+                vuln_ids = " ".join(v["cve"] for v in merged)
                 search = " ".join(filter(None, [
                     s.get("banner", ""), s.get("product", ""), s.get("version", ""),
                     s.get("service", ""), s.get("os", ""), s.get("ssl_cn", ""),
@@ -289,18 +375,84 @@ class Index:
                 self.conn.execute(
                     """INSERT INTO services(ip, ip_int, port, transport, service,
                            product, version, os, has_ssl, ssl_cn, ssl_issuer, banner,
-                           vulns, vuln_ids, search_text, seen_at, ssl_sans, ssl_trust)
-                       VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                           vulns, vuln_ids, search_text, seen_at, ssl_sans, ssl_trust,
+                           catalog_vulns, catalog_checked_at, catalog_revision, kev)
+                       VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                     (doc["ip"], ip_int, s["port"], s.get("transport", "tcp"),
                      s.get("service", ""), s.get("product", ""), s.get("version", ""),
                      s.get("os", ""), 1 if s.get("has_ssl") else 0,
                      s.get("ssl_cn", ""), s.get("ssl_issuer", ""),
                      s.get("banner", ""), json.dumps(vulns), vuln_ids, search, seen,
                      json.dumps(s.get("ssl_sans", [])),
-                     "unverified" if s.get("has_ssl") else "not_observed"),
+                     "unverified" if s.get("has_ssl") else "not_observed",
+                     json.dumps(catalog_matches), checked_at, revision,
+                     int(any(v.get("kev") for v in merged))),
                 )
 
-    # -- scan jobs (crawler history + resumability) ------------------------------
+    # -- offline advisory correlation --------------------------------------------
+
+    def reassess_catalog(self, query: str = "", *, limit: int = 1000, after_id: int = 0) -> dict:
+        """Bounded keyset pass over observations; no probes or timestamp changes.
+
+        Continue with the returned after_id while has_more is true. Reuse the
+        same query and avoid concurrent scans/catalog sync for a consistent pass.
+        """
+        from .query import compile_query
+
+        if type(limit) is not int or not 1 <= limit <= 10000:
+            raise ValueError("assessment limit must be 1..10000")
+        if type(after_id) is not int or after_id < 0:
+            raise ValueError("after_id must be a nonnegative integer")
+        where, params = compile_query(query)
+        revision = self.catalog.revision()
+        rows = self.conn.execute(
+            f"""SELECT s.id,s.product,s.version FROM services s JOIN hosts h USING(ip)
+                WHERE s.id>? AND ({where}) ORDER BY s.id LIMIT ?""",
+            [after_id, *params, limit + 1],
+        ).fetchall()
+        result = {"processed": 0, "matched_services": 0, "advisory_matches": 0,
+                  "after_id": after_id, "has_more": len(rows) > limit,
+                  "catalog_revision": revision}
+        for row in rows[:limit]:
+            matches = self._catalog_matches(row["product"], row["version"], revision=revision)
+            self.update_catalog_matches(row["id"], matches, revision=revision)
+            result["processed"] += 1
+            result["matched_services"] += bool(matches)
+            result["advisory_matches"] += len(matches)
+            result["after_id"] = row["id"]
+        return result
+
+    def update_catalog_matches(self, service_id: int, matches: list[dict], *, revision: int) -> None:
+        """Refresh advisory correlations, never the original network observation."""
+        if type(revision) is not int or revision < 0:
+            raise ValueError("catalog revision must be a nonnegative integer")
+        if not isinstance(matches, list) or any(
+            not isinstance(item, dict) or not isinstance(item.get("cve"), str)
+            for item in matches
+        ):
+            raise ValueError("catalog matches must be advisory dictionaries")
+        row = self.conn.execute(
+            """SELECT s.*, h.org, h.country, h.city, h.tags FROM services s
+               JOIN hosts h USING(ip) WHERE s.id=?""", (service_id,)
+        ).fetchone()
+        if row is None:
+            raise ValueError("no such service")
+        data = dict(row)
+        legacy = json.loads(data.get("vulns") or "[]")
+        merged = _merge_advisories(legacy, matches)
+        ids = " ".join(item["cve"] for item in merged)
+        tags = " ".join(json.loads(data.get("tags") or "[]"))
+        search = " ".join(str(data.get(key) or "") for key in (
+            "banner", "product", "version", "service", "os", "ssl_cn",
+            "ssl_issuer", "org", "country", "city",
+        )) + " " + tags + " " + ids
+        with self._tx():
+            self.conn.execute(
+                """UPDATE services SET catalog_vulns=?, catalog_checked_at=?,
+                   catalog_revision=?, vuln_ids=?, search_text=?, kev=? WHERE id=?""",
+                (json.dumps(matches), datetime.now(timezone.utc).isoformat(), revision,
+                 ids, search.lower(), int(any(item.get("kev") for item in merged)), service_id),
+            )
 
     def start_job(self, scope: str, ports: str, total: int, *, rate: float = 0,
                   concurrency: int = 0, seed: int = 0, config: dict | None = None) -> int:
@@ -359,10 +511,7 @@ class Index:
         doc["tags"] = json.loads(doc.get("tags") or "[]")
         svc = []
         for s in services:
-            d = dict(s)
-            d["vulns"] = json.loads(d.get("vulns") or "[]")
-            d["ssl_sans"] = json.loads(d.get("ssl_sans") or "[]")
-            svc.append(d)
+            svc.append(_service_doc(s))
         doc["services"] = svc
         doc["vuln_count"] = sum(len(s["vulns"]) for s in svc)
         return doc
@@ -393,7 +542,7 @@ class Index:
                 cvenow.entry(cve, allow_network=True)   # warm cache, no lock held
         counts = {"services": 0, "enriched": 0, "kev": 0}
         rows = self.conn.execute(
-            "SELECT id, version, vulns FROM services WHERE vuln_ids<>''").fetchall()
+            "SELECT id, version, vulns, catalog_vulns FROM services WHERE vuln_ids<>''").fetchall()
         with self._tx():
             for row in rows:
                 try:
@@ -405,7 +554,8 @@ class Index:
                 merged = [cvenow.enrich_vuln(v, row["version"] or "",
                                              allow_network=False)  # cache-only in tx
                           for v in vulns]
-                kev = 1 if any(v.get("kev") for v in merged) else 0
+                catalog = json.loads(row["catalog_vulns"] or "[]")
+                kev = int(any(v.get("kev") for v in _merge_advisories(merged, catalog)))
                 counts["services"] += 1
                 counts["enriched"] += sum(1 for v in merged if v.get("enriched"))
                 counts["kev"] += kev
@@ -511,9 +661,7 @@ class Index:
         ).fetchall()
         out = []
         for r in rows:
-            d = dict(r)
+            d = _service_doc(r)
             d["hostnames"] = json.loads(d.get("hostnames") or "[]")
-            d["vulns"] = json.loads(d.get("vulns") or "[]")
-            d["ssl_sans"] = json.loads(d.get("ssl_sans") or "[]")
             out.append(d)
         return out, total

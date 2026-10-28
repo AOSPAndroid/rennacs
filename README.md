@@ -166,11 +166,43 @@ cannot see backported patches or distro versioning, so it both misses real issue
 flags patched hosts. It's here to show the *mechanism* (fingerprint → known-CVE
 lookup), not to be a scanner you'd act on.
 
+## Local advisory catalog and offline reassessment
+
+The separate local advisory catalog expands potential product/version correlation
+beyond the handwritten rules. Catalog acquisition is explicit and budgeted;
+scanning, status, reassessment and page views use only locally cached advisories.
+The homepage's recent critical/KEV feed is **not** catalog coverage.
+
+```bash
+# Root --db must precede the command.
+python cli.py --db rennacs.db catalog status --json                 # offline
+python cli.py --db rennacs.db catalog sync --max-pages 1 --max-requests 50 --rate 1 --json
+python cli.py --db rennacs.db catalog fetch CVE-2024-6387 --max-requests 50 --rate 1 --json
+python cli.py --db rennacs.db catalog assess 'product:OpenSSH' --limit 1000 --after-id 0 --json
+python cli.py --db rennacs.db findings 'product:OpenSSH' --json     # offline report
+```
+
+Repeat bounded `sync` batches to resume pending details and pagination; a single
+batch and a successful exit do not imply a complete catalog. Reassessment uses
+service-keyset progress: continue with its returned `after_id` while `has_more` is
+true, keeping the database/query and catalog revision consistent. A full traversal
+is not an atomic source snapshot. A fresh-list ID can temporarily return 404;
+failed details remain pending rather than being silently skipped.
+
+`GET /api/catalog` provides local status only; `/findings` shows coverage,
+reassessment timestamps and source/range/fix evidence. No API or page view starts
+a sync. Matches remain **potential / low confidence**, not proof of vulnerability,
+exploitation, a working fix or asset security. Source summaries may be model-written;
+check provenance, vendor guidance and redistribution/attribution rights before use.
+See [the catalog guide](docs/CATALOG.md) for defaults, validation, exit codes,
+restart/resume semantics, matching limits and source-license caveats. These commands
+do not change scan authorization or establish production/global coverage.
+
 ## Live CVE data — cve.now integration
 
 The heuristic above only *guesses* CVE IDs. [cve.now](https://cve.now) — a free,
-no-auth public feed merging CVE List, OSV, GitHub Advisories, NVD and CISA KEV — turns
-those guesses into sourced facts. Run:
+no-auth public feed merging CVE List, OSV, GitHub Advisories, NVD and CISA KEV — adds
+sourced advisory metadata, not proof that those guesses apply to a host. Run:
 
 ```bash
 python cli.py enrich          # pulls authoritative data for your flagged CVEs
@@ -193,12 +225,14 @@ New `kev:true` filter finds services with a CISA Known-Exploited CVE.
 
 **Design guarantees** (see [rennacs/cvenow.py](rennacs/cvenow.py)):
 
-- **Offline-first.** Scanning and page views *never* hit the network — they read the
-  local cache only. Talking to cve.now is the explicit `enrich` step.
+- **Offline-first.** Scanning and page views *never* hit cve.now — they read the
+  local cache only. Source access is explicit through `enrich`, `cve`, or
+  `catalog sync` / `catalog fetch`.
 - **Graceful degradation.** Any network error falls back to cache, then to the
   heuristic. cve.now being down never breaks Rennacs.
-- **Sends nothing sensitive.** Only public CVE IDs leave the machine — never scan data,
-  host info, or credentials. No API key, no account.
+- **Sends no inventory to cve.now.** Advisory lookups send public advisory IDs;
+  catalog traversal also sends opaque pagination cursors. No scan data, host info
+  or credentials are uploaded. No API key or account is required.
 - **No new dependencies, SSRF-aware.** Uses only the stdlib `urllib`. Every CVE ID is
   validated before it enters a request URL; redirects are constrained to the cve.now
   host set (never an arbitrary or private host); responses are size-capped; and every
@@ -263,6 +297,9 @@ python cli.py geo          # place the public hosts in the index on the world ma
 - `cli.py` — command-line entry point (`scan`, `web`, `search`)
 - `rennacs/vulns.py` — heuristic CVE tagging from (product, version)
 - `rennacs/cvenow.py` — live cve.now client (enrichment, feed, cache, offline fallback)
+- `rennacs/catalog.py` — lossless local advisory details and bounded resumable ingestion
+- `rennacs/matching.py` — conservative product-bound offline advisory correlation
+- `docs/CATALOG.md` — catalog commands, coverage/reassessment semantics and limitations
 - `demo_seed.py` — loads a realistic demo dataset so the UI works with no scanning
 - `tests/` — pytest suite (query, authz, fingerprint, vulns, cvenow, db, API)
 
@@ -273,7 +310,7 @@ pip install -r requirements-dev.txt
 pytest
 ```
 
-174 tests cover the query compiler (including SQL-injection safety), the authorization
+The test suite covers the query compiler (including SQL-injection safety), the authorization
 gate (per-host and whole-network), fingerprinting, the vuln heuristics, the cve.now
 client, the geolocation client and the Shodan-InternetDB importer (CPE parsing, real-CVE
 mapping, caching — all with mocked fetchers, no live network in CI), the sweep engine
