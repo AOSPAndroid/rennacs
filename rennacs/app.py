@@ -110,6 +110,51 @@ def create_app(db_path: str | None = None) -> Flask:
 
     # -- JSON API ---------------------------------------------------------------
 
+    @app.route("/findings")
+    def findings_view():
+        from .findings import report
+
+        q = request.args.get("q", "").strip()
+        data, error = {"matches": [], "total": 0}, None
+        idx = index()
+        try:
+            page = int(request.args.get("page", "1"))
+            if page < 1:
+                raise ValueError("page must be positive")
+            data = report(idx, q, limit=25, offset=(page - 1) * 25)
+        except (ValueError, QueryError) as exc:
+            page, error = 1, str(exc)
+        finally:
+            idx.close()
+        return render_template("findings.html", q=q, data=data, error=error, page=page)
+
+    @app.get("/api/catalog")
+    def api_catalog():
+        """Local coverage metadata only; no web-triggered catalog acquisition."""
+        idx = index()
+        try:
+            return jsonify(idx.catalog.status())
+        finally:
+            idx.close()
+
+    @app.route("/api/findings")
+    def api_findings():
+        from .findings import report
+
+        try:
+            limit = int(request.args.get("limit", "100"))
+            offset = int(request.args.get("offset", "0"))
+            if not 1 <= limit <= 1000 or offset < 0:
+                raise ValueError("limit must be 1..1000 and offset nonnegative")
+            idx = index()
+            try:
+                data = report(idx, request.args.get("q", ""), limit=limit, offset=offset)
+            finally:
+                idx.close()
+        except (ValueError, QueryError) as exc:
+            return jsonify(error=str(exc)), 400
+        return jsonify(data)
+
     @app.route("/api/search")
     def api_search():
         q = request.args.get("q", "").strip()
@@ -125,6 +170,24 @@ def create_app(db_path: str | None = None) -> Flask:
         finally:
             idx.close()
         return jsonify(query=q, total=total, count=len(rows), matches=rows)
+
+    @app.route("/api/host/<ip>/history")
+    def api_host_history(ip: str):
+        try:
+            limit = int(request.args.get("limit", "100"))
+            offset = int(request.args.get("offset", "0"))
+            if not 1 <= limit <= 1000 or offset < 0:
+                raise ValueError("limit must be 1..1000 and offset nonnegative")
+        except ValueError as exc:
+            return jsonify(error=str(exc)), 400
+        idx = index()
+        try:
+            if idx.host(ip) is None:
+                return jsonify(error="not found", ip=ip), 404
+            events = idx.service_history(ip, limit=limit, offset=offset)
+        finally:
+            idx.close()
+        return jsonify(ip=ip, count=len(events), offset=offset, events=events)
 
     @app.route("/api/host/<ip>")
     def api_host(ip: str):

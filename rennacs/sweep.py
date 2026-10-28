@@ -28,7 +28,7 @@ import ipaddress
 import random
 import time
 from dataclasses import dataclass, field
-from math import gcd
+from math import gcd, isfinite
 
 from . import ports as portlib
 from . import scanner
@@ -94,11 +94,20 @@ def permutation(total: int, seed: int):
 
 
 class RateLimiter:
-    """Async token bucket: at most ``rate`` acquisitions per second (0 = unlimited)."""
+    """Refill at ``rate``/second, with a ``max(1, rate)`` initial burst.
+
+    Zero disables throttling; positive fractional rates still permit whole tokens.
+    """
 
     def __init__(self, rate: float):
-        self.rate = float(rate or 0)
-        self.tokens = self.rate
+        try:
+            self.rate = float(rate)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("rate must be a finite nonnegative number (0 = unlimited)") from exc
+        if not isfinite(self.rate) or self.rate < 0:
+            raise ValueError("rate must be finite and nonnegative (0 = unlimited)")
+        self.capacity = max(1.0, self.rate)
+        self.tokens = self.capacity
         self.updated = time.monotonic()
         self._lock = asyncio.Lock()
 
@@ -106,23 +115,33 @@ class RateLimiter:
         if not self.rate:
             return
         async with self._lock:
-            now = time.monotonic()
-            self.tokens = min(self.rate, self.tokens + (now - self.updated) * self.rate)
-            self.updated = now
-            if self.tokens < 1:
-                wait = (1 - self.tokens) / self.rate
-                await asyncio.sleep(wait)
-                self.tokens = 0
-            else:
-                self.tokens -= 1
+            while True:
+                now = time.monotonic()
+                self.tokens = min(self.capacity, self.tokens + (now - self.updated) * self.rate)
+                self.updated = now
+                if self.tokens >= 1:
+                    self.tokens -= 1
+                    return
+                await asyncio.sleep((1 - self.tokens) / self.rate)
 
 
 @dataclass
 class SweepStats:
+    """Completion totals plus a crash-safe checkpoint of the ordered prefix.
+
+    ``scanned`` includes ``start_at`` for compatibility; ``hosts_up``/``services``
+    count all completed results in this invocation. ``resume_at`` is an absolute
+    index, while ``resume_hosts_up``/``resume_services`` count only this invocation's
+    contiguous prefix. Add the latter to the previously persisted prefix counters.
+    """
+
     total: int = 0
     scanned: int = 0
     hosts_up: int = 0
     services: int = 0
+    resume_at: int = 0   # contiguous completed prefix, not a completion count
+    resume_hosts_up: int = 0  # prefix counters for this invocation only
+    resume_services: int = 0
 
 
 async def _scan_one(ip: str, port_list: list[int], limiter: RateLimiter,
@@ -135,7 +154,7 @@ async def _scan_one(ip: str, port_list: list[int], limiter: RateLimiter,
         if r is not None:
             services.append(r)
     services.sort(key=lambda s: s.port)
-    return HostResult(ip=ip, services=services)
+    return HostResult(ip=ip, services=services, scanned_ports=list(port_list))
 
 
 async def sweep(scope: str, port_spec: str = "top20", *, policy: Policy | None = None,
@@ -144,14 +163,27 @@ async def sweep(scope: str, port_spec: str = "top20", *, policy: Policy | None =
                 on_host=None, on_progress=None, progress_every: int = 50) -> SweepStats:
     """Sweep ``scope`` (CIDR / comma list) across ``port_spec``.
 
-    ``policy`` gates the whole scope up front. ``on_host(HostResult)`` streams each live
-    host; ``on_progress(SweepStats, seed)`` fires every ``progress_every`` hosts.
-    ``seed``/``start_at`` make a sweep resumable (same seed, skip the first K indices).
+    ``policy`` gates the whole scope up front. ``on_host(HostResult)`` streams every
+    completed host, including results with no observed services; its successful
+    return precedes checkpoint advancement. ``on_progress(SweepStats, seed)`` fires
+    every ``progress_every`` completions and once at normal completion.
+
+    Resume with ``start_at=stats.resume_at`` and the same scope, ports, shuffle mode
+    and seed. ``stats.scanned`` is a completion count, NOT a safe cursor. Persist the
+    previous prefix counters plus ``stats.resume_hosts_up``/``stats.resume_services``;
+    out-of-order results may be replayed and callbacks must tolerate duplicates.
     Returns final :class:`SweepStats`.
     """
     policy = policy or Policy()
     port_list = portlib.resolve(port_spec)
     space = TargetSpace.from_scope(scope)
+    if type(start_at) is not int or not 0 <= start_at <= space.total:
+        raise ValueError("start_at must be an integer within the target space")
+    if type(concurrency) is not int or concurrency <= 0:
+        raise ValueError("concurrency must be a positive integer")
+    if type(progress_every) is not int or progress_every <= 0:
+        raise ValueError("progress_every must be a positive integer")
+    scanner._check_timeout(timeout)
 
     # Gate every CIDR in the scope before touching the network.
     for part in scope.split(","):
@@ -164,32 +196,51 @@ async def sweep(scope: str, port_spec: str = "top20", *, policy: Policy | None =
     perm = permutation(space.total, seed) if shuffle else (lambda i: i)
 
     limiter = RateLimiter(rate)
-    stats = SweepStats(total=space.total, scanned=start_at)
-    counter = {"i": start_at}
-    lock = asyncio.Lock()
+    stats = SweepStats(total=space.total, scanned=start_at, resume_at=start_at)
+    next_index = start_at
+    completed: dict[int, tuple[int, int]] = {}
+    worker_count = max(1, min(concurrency, space.total))
+    condition = asyncio.Condition()
 
     async def worker():
+        nonlocal next_index
         while True:
-            async with lock:
-                i = counter["i"]
+            async with condition:
+                # Bound both outstanding work and completed holes behind a straggler.
+                await condition.wait_for(lambda: next_index >= space.total or
+                                         next_index < stats.resume_at + worker_count)
+                i = next_index
                 if i >= space.total:
                     return
-                counter["i"] = i + 1
+                next_index = i + 1
             ip = space.addr(perm(i))
             hr = await _scan_one(ip, port_list, limiter, timeout)
-            async with lock:
+            async with condition:
+                hosts_up, services = int(bool(hr.services)), len(hr.services)
                 stats.scanned += 1
-                if hr.services:
-                    stats.hosts_up += 1
-                    stats.services += len(hr.services)
-                    if on_host:
-                        on_host(hr)
+                stats.hosts_up += hosts_up
+                stats.services += services
+                if on_host:
+                    on_host(hr)
+                completed[i] = (hosts_up, services)
+                while stats.resume_at in completed:
+                    hosts_up, services = completed.pop(stats.resume_at)
+                    stats.resume_hosts_up += hosts_up
+                    stats.resume_services += services
+                    stats.resume_at += 1
+                condition.notify_all()
                 if on_progress and stats.scanned % progress_every == 0:
                     on_progress(stats, seed)
 
     workers = [asyncio.create_task(worker())
-               for _ in range(max(1, min(concurrency, space.total)))]
-    await asyncio.gather(*workers)
+               for _ in range(worker_count)]
+    try:
+        await asyncio.gather(*workers)
+    finally:
+        for task in workers:
+            if not task.done():
+                task.cancel()
+        await asyncio.gather(*workers, return_exceptions=True)
     if on_progress:
         on_progress(stats, seed)
     return stats

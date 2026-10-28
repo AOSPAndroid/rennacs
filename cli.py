@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Rennacs command-line interface.
 
-    python cli.py scan 127.0.0.1                 scan one host (top100 ports)
+    python cli.py scan 127.0.0.1                 scan one host (multiservice TCP)
     python cli.py sweep 192.168.0.0/16 -p top20  sweep a whole network (Shodan-style)
     python cli.py sweep 10.0.0.0/24 --repeat 0 --interval 600   continuous re-crawl
     python cli.py sweep --resume 7               resume an interrupted sweep
@@ -20,6 +20,8 @@ from __future__ import annotations
 import argparse
 import asyncio
 import ipaddress
+import json
+import math
 import random
 import sys
 import time
@@ -42,6 +44,8 @@ def cmd_scan(args) -> int:
 
     def on_host(hr: scanner.HostResult):
         idx.upsert_host(hr)
+        if not hr.services:
+            return  # the callback also carries unknown/no-response refreshes
         count["hosts"] += 1
         count["services"] += len(hr.services)
         ports = ", ".join(f"{s.port}"
@@ -49,20 +53,21 @@ def cmd_scan(args) -> int:
                           for s in hr.services)
         print(f"  {hr.ip:<16} {len(hr.services):>3} open  [{ports}]")
 
-    print(f"Scanning {args.target}  ports={args.ports}  timeout={args.timeout}s")
     try:
+        print(f"Scanning {args.target}  ports={args.ports}  timeout={args.timeout}s")
         asyncio.run(scanner.scan(
             args.target, args.ports, policy=policy, timeout=args.timeout,
             on_host=on_host,
         ))
     except NotAuthorized as e:
         print(f"\n[REFUSED] {e}", file=sys.stderr)
-        idx.close()
         return 2
+    except OSError as e:
+        print(f"\n[FAILED] {e}", file=sys.stderr)
+        return 1
     finally:
-        pass
+        idx.close()
 
-    idx.close()
     print(f"\nDone. {count['hosts']} host(s), {count['services']} service(s) indexed "
           f"into {args.db}.")
     if count["hosts"] == 0:
@@ -78,15 +83,31 @@ def cmd_sweep(args) -> int:
     idx = Index(args.db)
 
     scope, seed, start_at, job_id = args.scope, None, 0, None
+    base_hosts_up, base_services = 0, 0
     if args.resume:
         job = idx.get_job(args.resume)
         if not job:
             print(f"no such job: {args.resume}", file=sys.stderr)
             idx.close()
             return 1
+        config = job["config"]
+        if config.get("version") != 2 or not config.get("ports"):
+            print("Legacy job has no safe traversal configuration; start a fresh sweep.", file=sys.stderr)
+            idx.close()
+            return 2
+        if job["status"] == "done":
+            print("Job is already complete; start a fresh sweep.", file=sys.stderr)
+            idx.close()
+            return 2
         scope, seed, start_at, job_id = (job["scope"], job["seed"],
-                                         job["scanned"], job["id"])
-        args.ports = job["ports"]
+                                         job["resume_at"], job["id"])
+        args.ports = ",".join(str(port) for port in config["ports"])
+        args.no_shuffle = not config["shuffle"]
+        args.timeout = config["timeout"]
+        args.rate = config["rate"]
+        args.concurrency = config["concurrency"]
+        args.checkpoint_every = config.get("progress_every", 50)
+        base_hosts_up, base_services = job["hosts_up"], job["services"]
         print(f"Resuming job {job_id}: {scope} from host {start_at}/{job['total']}")
     if not scope:
         print("sweep needs a SCOPE (CIDR) or --resume <job>", file=sys.stderr)
@@ -95,10 +116,21 @@ def cmd_sweep(args) -> int:
 
     # Gate the WHOLE scope up front — never start a job we can't run.
     try:
+        from rennacs.ports import resolve
+        selected_ports = resolve(args.ports)
+        sweepmod.RateLimiter(args.rate)
+        scanner._check_timeout(args.timeout)
+        if args.concurrency <= 0 or args.checkpoint_every <= 0:
+            raise ValueError("concurrency and checkpoint interval must be positive")
+        if args.repeat < 0 or args.interval < 0:
+            raise ValueError("repeat and interval must be nonnegative")
         for part in scope.split(","):
             if part.strip():
                 policy.check_network(ipaddress.ip_network(part.strip(), strict=False))
-    except (NotAuthorized, ValueError) as e:
+        space = sweepmod.TargetSpace.from_scope(scope)
+        if not space.total or not 0 <= start_at <= space.total:
+            raise ValueError("scope must be nonempty and resume cursor within scope")
+    except (NotAuthorized, ValueError, TypeError) as e:
         print(f"[REFUSED] {e}", file=sys.stderr)
         idx.close()
         return 2
@@ -106,8 +138,10 @@ def cmd_sweep(args) -> int:
         print("[!] --i-am-authorized set: you assert you have permission to sweep "
               "this scope. Only sweep networks you own or may test.\n")
 
-    space = sweepmod.TargetSpace.from_scope(scope)
     shuffle = not args.no_shuffle
+    config = {"version": 2, "ports": selected_ports, "shuffle": shuffle,
+              "timeout": args.timeout, "rate": args.rate,
+              "concurrency": args.concurrency, "progress_every": args.checkpoint_every}
     rounds, rnd = args.repeat, 0
     rc = 0
     try:
@@ -118,7 +152,7 @@ def cmd_sweep(args) -> int:
                             else (random.randrange(1, 2**31) if shuffle else 0))
                 job_id = idx.start_job(scope, args.ports, space.total,
                                        rate=args.rate, concurrency=args.concurrency,
-                                       seed=use_seed)
+                                       seed=use_seed, config=config)
             else:
                 use_seed = seed if seed is not None else 0
             print(f"[job {job_id}] sweeping {scope}  hosts={space.total}  "
@@ -131,10 +165,11 @@ def cmd_sweep(args) -> int:
 
             def on_progress(stats, sd):
                 idx.checkpoint_job(job_id, scanned=stats.scanned,
-                                   hosts_up=stats.hosts_up, services=stats.services,
-                                   seed=sd)
+                                   hosts_up=base_hosts_up + stats.resume_hosts_up,
+                                   services=base_services + stats.resume_services,
+                                   seed=sd, resume_at=stats.resume_at)
                 el = time.monotonic() - t0
-                r = stats.scanned / el if el > 0 else 0
+                r = (stats.scanned - start_at) / el if el > 0 else 0
                 sys.stdout.write(
                     f"\r  {stats.scanned}/{stats.total} hosts  up={stats.hosts_up}  "
                     f"services={stats.services}  {r:.0f} hosts/s   ")
@@ -144,11 +179,12 @@ def cmd_sweep(args) -> int:
                 scope, args.ports, policy=policy, rate=args.rate,
                 concurrency=args.concurrency, timeout=args.timeout, shuffle=shuffle,
                 seed=use_seed, start_at=start_at, on_host=on_host,
-                on_progress=on_progress))
+                on_progress=on_progress, progress_every=args.checkpoint_every))
             idx.finish_job(job_id, "done")
-            print(f"\n[job {job_id}] done: {stats.hosts_up} host(s) up, "
-                  f"{stats.services} service(s) across {stats.scanned} scanned.")
+            print(f"\n[job {job_id}] done: {base_hosts_up + stats.hosts_up} host(s) up, "
+                  f"{base_services + stats.services} service(s) across {stats.scanned} scanned.")
             job_id, seed, start_at = None, None, 0   # next round is a fresh sweep
+            base_hosts_up, base_services = 0, 0
 
             if rounds and rnd >= rounds:
                 break
@@ -160,7 +196,13 @@ def cmd_sweep(args) -> int:
             idx.finish_job(job_id, "interrupted")
             print(f"\n[interrupted] resume with:  python cli.py sweep --resume {job_id}")
         rc = 130
-    idx.close()
+    except Exception as exc:
+        if job_id is not None:
+            idx.finish_job(job_id, "failed")
+        print(f"[FAILED] {exc}", file=sys.stderr)
+        rc = 1
+    finally:
+        idx.close()
     return rc
 
 
@@ -178,6 +220,141 @@ def cmd_jobs(args) -> int:
         print(f"{j['id']:>3}  {j['status']:<11} {j['scope']:<22} {prog:>12}  "
               f"{j['hosts_up']:>3}  {j['services']:>4}  {when}")
     return 0
+
+
+def cmd_plan(args) -> int:
+    """Compute address/port workload locally; never authorize or execute a scan."""
+    from rennacs.planner import build_plan
+
+    try:
+        data = build_plan(args.scope, args.ports, rate=args.rate,
+                          days=args.days, exclude=args.exclude)
+    except ValueError as exc:
+        print(f"plan error: {exc}", file=sys.stderr)
+        return 2
+    if args.json:
+        print(json.dumps(data, indent=2))
+    else:
+        print(f"OFFLINE TCP PLAN — {data['scope']}")
+        print(f"Addresses: {data['address_count']:,}  Ports: {data['port_count']:,}")
+        print(f"Attempts: {data['attempt_count']:,}")
+        print(f"Required for {data['days']:g} days: {data['required_rate']:,.2f} attempts/s")
+        print(f"At {data['rate']:g}/s: at least {data['duration_lower_bound_days']:,.2f} days")
+        for warning in data["warnings"]:
+            print(f"[!] {warning}")
+    return 0
+
+
+def cmd_findings(args) -> int:
+    """Export local, evidence-backed assessments without network requests."""
+    from rennacs.findings import report
+
+    idx = Index(args.db)
+    try:
+        data = report(idx, args.query, limit=args.limit, offset=args.offset)
+    except (ValueError, QueryError) as exc:
+        print(f"report error: {exc}", file=sys.stderr)
+        return 2
+    finally:
+        idx.close()
+    if args.json:
+        print(json.dumps(data, indent=2))
+    else:
+        print(data["notice"])
+        print(f"{data['total']} service assessment(s); showing {data['count']}.")
+        for finding in data["matches"]:
+            cves = ", ".join(v["cve"] for v in finding["advisories"])
+            print(f"  {finding['ip']}:{finding['port']}/{finding['transport']} "
+                  f"potential / low confidence  {cves}")
+    return 0
+
+
+def cmd_catalog(args) -> int:
+    """Explicit catalog operations; local reads never contact the source."""
+    from rennacs.catalog import Catalog, valid_id
+
+    try:
+        if args.catalog_cmd in {"sync", "fetch"}:
+            if (args.max_requests < 1 or not math.isfinite(args.rate) or args.rate <= 0
+                    or (args.catalog_cmd == "sync" and args.max_pages < 1)):
+                raise ValueError("page/request budgets and finite rate must be positive")
+        if args.catalog_cmd == "fetch":
+            for identifier in args.ids:
+                if not valid_id(identifier):  # Never strip or repair source tokens.
+                    raise ValueError("invalid advisory ID")
+    except ValueError as exc:
+        print(f"catalog error: {exc}", file=sys.stderr)
+        return 2
+    catalog = Catalog(args.db)
+    rc = 0
+    try:
+        if args.catalog_cmd == "sync":
+            data = catalog.sync(max_pages=args.max_pages, max_requests=args.max_requests,
+                                rate=args.rate, restart=args.restart)
+        elif args.catalog_cmd == "fetch":
+            data = catalog.fetch_ids(args.ids, max_requests=args.max_requests, rate=args.rate)
+        else:
+            data = catalog.status()
+        if args.catalog_cmd in {"sync", "fetch"} and data['stop_reason'] == 'error':
+            rc = 1
+    except KeyboardInterrupt:
+        rc = 130
+        data = {"interrupted": True, "complete": False, "stop_reason": "interrupted",
+                "status": catalog.status()}
+    finally:
+        catalog.close()
+    if args.json:
+        print(json.dumps(data, indent=2))
+    else:
+        state = data.get("status", data)
+        if data.get("interrupted"):
+            print("Interrupted; this batch is incomplete. Resume the explicit CLI operation.")
+        elif args.catalog_cmd in {"sync", "fetch"}:
+            print(f"Requests: {data['requests']}; pages: {data['pages']}; "
+                  f"stored: {data['stored']}; stopped: {data['stop_reason']}")
+        print(f"Local advisory catalog ({state['source']}): {state['traversal']}")
+        print(f"Stored details: {state['stored_details']}; pending: {state['pending_details']}")
+        print(f"Listing exhausted: {state['listing_exhausted']}; traversal complete: {state['complete']}")
+        print("Coverage describes a traversal, not an atomic snapshot or proof of asset security.")
+        if state['last_error']:
+            print(f"Last catalog error: {state['last_error']['message']}", file=sys.stderr)
+    return rc
+
+
+def cmd_catalog_assess(args) -> int:
+    """Reassess one keyset page of recorded services without network probes."""
+    try:
+        if not 1 <= args.limit <= 10000 or args.after_id < 0:
+            raise ValueError("limit must be 1..10000 and after-id nonnegative")
+        compile_query(args.query)
+    except (ValueError, QueryError) as exc:
+        print(f"catalog assessment error: {exc}", file=sys.stderr)
+        return 2
+    idx = Index(args.db)
+    interrupted = False
+    try:
+        data = idx.reassess_catalog(args.query, limit=args.limit, after_id=args.after_id)
+    except KeyboardInterrupt:
+        interrupted = True
+        # Replaying the original page is safe; never guess the last committed service.
+        data = {"interrupted": True, "after_id": args.after_id, "has_more": True}
+    finally:
+        idx.close()
+    if args.json:
+        print(json.dumps(data, indent=2))
+    elif interrupted:
+        print(f"Interrupted; replay this page with the same query and --after-id {args.after_id}.")
+    else:
+        print(f"Offline catalog reassessment: {data['processed']} service(s); "
+              f"{data['matched_services']} matched; {data['advisory_matches']} advisory match(es).")
+        print(f"catalog revision: {data['catalog_revision']}; after_id: {data['after_id']}; "
+              f"has_more: {data['has_more']}")
+        if data['has_more']:
+            print(f"Partial pass. Continue with the same database/query and --after-id {data['after_id']}.")
+        else:
+            print("Selected service traversal exhausted at this point; not proof of security.")
+        print("Keyset progress is not a snapshot; avoid concurrent scans/catalog changes during a pass.")
+    return 130 if interrupted else 0
 
 
 def cmd_search(args) -> int:
@@ -379,8 +556,8 @@ def build_parser() -> argparse.ArgumentParser:
 
     p = sub.add_parser("scan", help="scan a target and index the results")
     p.add_argument("target", help="IP, CIDR, hostname, or comma list")
-    p.add_argument("-p", "--ports", default="top100",
-                   help="top20 | top100 | all | 22,80,443 | 8000-8100")
+    p.add_argument("-p", "--ports", default="multiservice",
+                   help="TCP: multiservice | web | remote | mail | databases | infrastructure | all-tcp | ports/ranges")
     p.add_argument("-t", "--timeout", type=float, default=2.0,
                    help="per-connection timeout in seconds")
     p.add_argument("--i-am-authorized", action="store_true",
@@ -390,8 +567,8 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("sweep", help="network-wide sweep (Shodan-style crawler)")
     p.add_argument("scope", nargs="?", default="",
                    help="CIDR or comma list, e.g. 192.168.0.0/16 (omit with --resume)")
-    p.add_argument("-p", "--ports", default="top20",
-                   help="top20 | top100 | all | 22,80,443 | 8000-8100")
+    p.add_argument("-p", "--ports", default="multiservice",
+                   help="TCP: multiservice | web | remote | mail | databases | infrastructure | all-tcp | ports/ranges")
     p.add_argument("-t", "--timeout", type=float, default=2.0)
     p.add_argument("--rate", type=float, default=500,
                    help="max new connections per second across the whole sweep "
@@ -406,6 +583,8 @@ def build_parser() -> argparse.ArgumentParser:
                    help="seconds to wait between re-crawl rounds")
     p.add_argument("--resume", type=int, metavar="JOB",
                    help="resume an interrupted sweep by job id")
+    p.add_argument("--checkpoint-every", type=int, default=50,
+                   help="persist safe resume state every N completed hosts")
     p.add_argument("--i-am-authorized", action="store_true",
                    help="assert permission to sweep a public scope you own")
     p.set_defaults(func=cmd_sweep)
@@ -413,6 +592,47 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("jobs", help="list sweep / crawl history")
     p.add_argument("-n", "--limit", type=int, default=20)
     p.set_defaults(func=cmd_jobs)
+
+    p = sub.add_parser("plan", help="offline IPv4/TCP workload estimate; does not scan")
+    p.add_argument("scope", nargs="?", default="public-ipv4")
+    p.add_argument("-p", "--ports", default="multiservice")
+    p.add_argument("--rate", type=float, default=500)
+    p.add_argument("--days", type=float, default=7)
+    p.add_argument("--exclude", action="append", default=[], help="IPv4/CIDR exclusions")
+    p.add_argument("--json", action="store_true")
+    p.set_defaults(func=cmd_plan)
+
+    p = sub.add_parser("findings", help="local potential-vulnerability assessment reports")
+    p.add_argument("query", nargs="?", default="")
+    p.add_argument("--limit", type=int, default=100)
+    p.add_argument("--offset", type=int, default=0)
+    p.add_argument("--json", action="store_true", help="machine-readable local report")
+    p.set_defaults(func=cmd_findings)
+
+    p = sub.add_parser("catalog", help="local advisory catalog and offline reassessment")
+    catalog_sub = p.add_subparsers(dest="catalog_cmd", required=True)
+    p = catalog_sub.add_parser("status", help="offline local coverage status")
+    p.add_argument("--json", action="store_true")
+    p.set_defaults(func=cmd_catalog)
+    p = catalog_sub.add_parser("sync", help="explicit bounded, resumable source traversal")
+    p.add_argument("--max-pages", type=int, default=1)
+    p.add_argument("--max-requests", type=int, default=50)
+    p.add_argument("--rate", type=float, default=1.0)
+    p.add_argument("--restart", action="store_true")
+    p.add_argument("--json", action="store_true")
+    p.set_defaults(func=cmd_catalog)
+    p = catalog_sub.add_parser("fetch", help="fetch explicit advisory IDs, not full coverage")
+    p.add_argument("ids", nargs="*", help="exact source IDs; omit to resume pending targeted details")
+    p.add_argument("--max-requests", type=int, default=50)
+    p.add_argument("--rate", type=float, default=1.0)
+    p.add_argument("--json", action="store_true")
+    p.set_defaults(func=cmd_catalog)
+    p = catalog_sub.add_parser("assess", help="offline reassessment of one service keyset page")
+    p.add_argument("query", nargs="?", default="")
+    p.add_argument("--limit", type=int, default=1000)
+    p.add_argument("--after-id", type=int, default=0)
+    p.add_argument("--json", action="store_true")
+    p.set_defaults(func=cmd_catalog_assess)
 
     p = sub.add_parser("search", help="query the index from the terminal")
     p.add_argument("query", nargs="?", default="", help="filter query string")
