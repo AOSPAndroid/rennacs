@@ -47,6 +47,8 @@ CREATE TABLE IF NOT EXISTS services (
     has_ssl     INTEGER DEFAULT 0,
     ssl_cn      TEXT,
     ssl_issuer  TEXT,
+    ssl_sans    TEXT DEFAULT '[]',
+    ssl_trust   TEXT DEFAULT 'not_observed',
     banner      TEXT,
     vulns       TEXT,          -- json list of {cve, severity, summary, ...enrichment}
     vuln_ids    TEXT,          -- space-joined CVE ids, for vuln:/has_vuln: filters
@@ -56,6 +58,17 @@ CREATE TABLE IF NOT EXISTS services (
     UNIQUE(ip, port, transport),
     FOREIGN KEY(ip) REFERENCES hosts(ip) ON DELETE CASCADE
 );
+CREATE TABLE IF NOT EXISTS service_observations (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    ip TEXT NOT NULL,
+    port INTEGER NOT NULL,
+    transport TEXT NOT NULL,
+    state TEXT NOT NULL,
+    observed_at TEXT NOT NULL,
+    details TEXT NOT NULL,
+    note TEXT NOT NULL,
+    FOREIGN KEY(ip) REFERENCES hosts(ip) ON DELETE CASCADE
+);
 CREATE TABLE IF NOT EXISTS scan_jobs (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
     scope       TEXT,              -- the CIDR / comma list swept
@@ -63,6 +76,8 @@ CREATE TABLE IF NOT EXISTS scan_jobs (
     seed        INTEGER,           -- permutation seed (for deterministic resume)
     total       INTEGER,           -- total hosts in scope
     scanned     INTEGER DEFAULT 0, -- hosts visited so far (the resume cursor)
+    resume_at   INTEGER DEFAULT 0, -- contiguous completed prefix, safe to resume
+    config      TEXT,              -- effective traversal and probe configuration
     hosts_up    INTEGER DEFAULT 0,
     services    INTEGER DEFAULT 0,
     rate        REAL,
@@ -81,6 +96,7 @@ CREATE INDEX IF NOT EXISTS idx_services_port    ON services(port);
 CREATE INDEX IF NOT EXISTS idx_services_product ON services(product);
 CREATE INDEX IF NOT EXISTS idx_services_ip      ON services(ip);
 CREATE INDEX IF NOT EXISTS idx_services_ip_int  ON services(ip_int);
+CREATE INDEX IF NOT EXISTS idx_observations_host ON service_observations(ip, id);
 """
 
 
@@ -114,12 +130,18 @@ class Index:
         """
         have = {r["name"] for r in self.conn.execute("PRAGMA table_info(services)")}
         for name, ddl in (("ip_int", "INTEGER"), ("vulns", "TEXT"),
-                          ("vuln_ids", "TEXT"), ("kev", "INTEGER DEFAULT 0")):
+                          ("vuln_ids", "TEXT"), ("kev", "INTEGER DEFAULT 0"),
+                          ("ssl_sans", "TEXT DEFAULT '[]'"),
+                          ("ssl_trust", "TEXT DEFAULT 'not_observed'")):
             if name not in have:
                 self.conn.execute(f"ALTER TABLE services ADD COLUMN {name} {ddl}")
         have_h = {r["name"] for r in self.conn.execute("PRAGMA table_info(hosts)")}
         if "tags" not in have_h:
             self.conn.execute("ALTER TABLE hosts ADD COLUMN tags TEXT")
+        have_j = {r["name"] for r in self.conn.execute("PRAGMA table_info(scan_jobs)")}
+        for name, ddl in (("resume_at", "INTEGER DEFAULT 0"), ("config", "TEXT")):
+            if name not in have_j:
+                self.conn.execute(f"ALTER TABLE scan_jobs ADD COLUMN {name} {ddl}")
 
     def close(self) -> None:
         self.conn.close()
@@ -136,9 +158,20 @@ class Index:
     # -- writing -----------------------------------------------------------------
 
     def upsert_host(self, host) -> None:
-        """Insert/replace one HostResult (from scanner) and its services."""
+        """Refresh attempted services and retain an explicit observation trail.
+
+        A missing response is not proof of closure, remediation, or security.
+        ``scanned_ports=None`` preserves the legacy full-snapshot behavior.
+        """
+        if not host.services and not self.conn.execute(
+            "SELECT 1 FROM hosts WHERE ip=?", (host.ip,)
+        ).fetchone():
+            return  # do not store billions of empty/unknown address documents
         geo = enrich(host.ip)
         with self._tx():
+            previous = self.conn.execute(
+                "SELECT * FROM services WHERE ip=?", (host.ip,)
+            ).fetchall()
             self.conn.execute(
                 """INSERT INTO hosts(ip, hostnames, country, city, org, asn,
                        lat, lon, seen_at)
@@ -150,8 +183,30 @@ class Index:
                 (host.ip, json.dumps(host.hostnames), geo.country, geo.city,
                  geo.org, geo.asn, geo.lat, geo.lon, host.seen_at),
             )
-            # replace this host's services so a re-scan reflects current reality
-            self.conn.execute("DELETE FROM services WHERE ip=?", (host.ip,))
+            # Only replace ports this observation actually attempted. A partial
+            # web scan must not silently erase a previously observed SSH service.
+            scanned_ports = getattr(host, "scanned_ports", None)
+            touched = set(scanned_ports) if scanned_ports is not None else None
+            live = {(s.port, s.transport) for s in host.services}
+            for old in previous:
+                selected = touched is None or (old["transport"] == "tcp" and old["port"] in touched)
+                if selected and (old["port"], old["transport"]) not in live:
+                    self.conn.execute(
+                        """INSERT INTO service_observations
+                           (ip,port,transport,state,observed_at,details,note)
+                           VALUES(?,?,?,'not_observed',?,?,?)""",
+                        (host.ip, old["port"], old["transport"], host.seen_at,
+                         json.dumps(dict(old)),
+                         "Not observed on rescan; not proof of closure or remediation."),
+                    )
+            if scanned_ports is None:  # legacy callers supply a full-host snapshot
+                self.conn.execute("DELETE FROM services WHERE ip=?", (host.ip,))
+            else:
+                self.conn.executemany(
+                    "DELETE FROM services WHERE ip=? AND port=? AND transport=?",
+                    ((host.ip, old["port"], old["transport"]) for old in previous
+                     if old["transport"] == "tcp" and old["port"] in touched),
+                )
             ip_int = ip_to_int(host.ip)
             for s in host.services:
                 vuln_ids = " ".join(v["cve"] for v in s.vulns)
@@ -162,12 +217,30 @@ class Index:
                 self.conn.execute(
                     """INSERT INTO services(ip, ip_int, port, transport, service,
                            product, version, os, has_ssl, ssl_cn, ssl_issuer, banner,
-                           vulns, vuln_ids, search_text, seen_at)
-                       VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                           vulns, vuln_ids, search_text, seen_at, ssl_sans, ssl_trust)
+                       VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                     (host.ip, ip_int, s.port, s.transport, s.service, s.product,
                      s.version, s.os, 1 if s.has_ssl else 0, s.ssl_cn, s.ssl_issuer,
-                     s.banner, json.dumps(s.vulns), vuln_ids, search, s.seen_at),
+                     s.banner, json.dumps(s.vulns), vuln_ids, search, s.seen_at,
+                     json.dumps(s.ssl_sans), "unverified" if s.has_ssl else "not_observed"),
                 )
+                self.conn.execute(
+                    """INSERT INTO service_observations
+                       (ip,port,transport,state,observed_at,details,note)
+                       VALUES(?,?,?,'open',?,?,?)""",
+                    (host.ip, s.port, s.transport, host.seen_at, json.dumps(asdict(s)),
+                     "Service answered; vulnerability status remains unverified."),
+                )
+
+    def service_history(self, ip: str, *, limit: int = 100, offset: int = 0) -> list[dict]:
+        """Bounded newest-first observation events, including missing responses."""
+        if not 1 <= limit <= 1000 or offset < 0:
+            raise ValueError("history limit must be 1..1000 and offset nonnegative")
+        rows = self.conn.execute(
+            "SELECT * FROM service_observations WHERE ip=? ORDER BY id DESC LIMIT ? OFFSET ?",
+            (ip, limit, offset),
+        ).fetchall()
+        return [dict(row, details=json.loads(row["details"])) for row in rows]
 
     def insert_raw(self, doc: dict) -> None:
         """Insert a plain dict document (used by the demo seeder).
@@ -216,34 +289,37 @@ class Index:
                 self.conn.execute(
                     """INSERT INTO services(ip, ip_int, port, transport, service,
                            product, version, os, has_ssl, ssl_cn, ssl_issuer, banner,
-                           vulns, vuln_ids, search_text, seen_at)
-                       VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                           vulns, vuln_ids, search_text, seen_at, ssl_sans, ssl_trust)
+                       VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                     (doc["ip"], ip_int, s["port"], s.get("transport", "tcp"),
                      s.get("service", ""), s.get("product", ""), s.get("version", ""),
                      s.get("os", ""), 1 if s.get("has_ssl") else 0,
                      s.get("ssl_cn", ""), s.get("ssl_issuer", ""),
-                     s.get("banner", ""), json.dumps(vulns), vuln_ids, search, seen),
+                     s.get("banner", ""), json.dumps(vulns), vuln_ids, search, seen,
+                     json.dumps(s.get("ssl_sans", [])),
+                     "unverified" if s.get("has_ssl") else "not_observed"),
                 )
 
     # -- scan jobs (crawler history + resumability) ------------------------------
 
     def start_job(self, scope: str, ports: str, total: int, *, rate: float = 0,
-                  concurrency: int = 0, seed: int = 0) -> int:
+                  concurrency: int = 0, seed: int = 0, config: dict | None = None) -> int:
         now = datetime.now(timezone.utc).isoformat()
         cur = self.conn.execute(
             """INSERT INTO scan_jobs(scope, ports, seed, total, scanned, status,
-                   rate, concurrency, started_at, updated_at)
-               VALUES(?,?,?,?,0,'running',?,?,?,?)""",
-            (scope, ports, seed, total, rate, concurrency, now, now))
+                   rate, concurrency, started_at, updated_at, resume_at, config)
+               VALUES(?,?,?,?,0,'running',?,?,?,?,0,?)""",
+            (scope, ports, seed, total, rate, concurrency, now, now,
+             json.dumps(config or {}, sort_keys=True)))
         self.conn.commit()
         return cur.lastrowid
 
     def checkpoint_job(self, job_id: int, *, scanned: int, hosts_up: int,
-                       services: int, seed: int = 0) -> None:
+                       services: int, seed: int = 0, resume_at: int | None = None) -> None:
         self.conn.execute(
-            """UPDATE scan_jobs SET scanned=?, hosts_up=?, services=?, seed=?,
+            """UPDATE scan_jobs SET scanned=?, hosts_up=?, services=?, seed=?, resume_at=?,
                    updated_at=? WHERE id=?""",
-            (scanned, hosts_up, services, seed,
+            (scanned, hosts_up, services, seed, scanned if resume_at is None else resume_at,
              datetime.now(timezone.utc).isoformat(), job_id))
         self.conn.commit()
 
@@ -257,17 +333,17 @@ class Index:
     def get_job(self, job_id: int) -> dict | None:
         row = self.conn.execute(
             "SELECT * FROM scan_jobs WHERE id=?", (job_id,)).fetchone()
-        return dict(row) if row else None
+        return dict(row, config=json.loads(row["config"] or "{}")) if row else None
 
     def list_jobs(self, limit: int = 20) -> list[dict]:
-        return [dict(r) for r in self.conn.execute(
+        return [dict(r, config=json.loads(r["config"] or "{}")) for r in self.conn.execute(
             "SELECT * FROM scan_jobs ORDER BY id DESC LIMIT ?", (limit,)).fetchall()]
 
     def resumable_jobs(self) -> list[dict]:
         """Running/interrupted jobs that haven't finished their scope."""
-        return [dict(r) for r in self.conn.execute(
-            "SELECT * FROM scan_jobs WHERE status IN ('running','interrupted') "
-            "AND scanned < total ORDER BY id DESC").fetchall()]
+        return [dict(r, config=json.loads(r["config"] or "{}")) for r in self.conn.execute(
+            "SELECT * FROM scan_jobs WHERE status IN ('running','interrupted','failed') "
+            "AND resume_at < total ORDER BY id DESC").fetchall()]
 
     # -- reading -----------------------------------------------------------------
 
@@ -285,6 +361,7 @@ class Index:
         for s in services:
             d = dict(s)
             d["vulns"] = json.loads(d.get("vulns") or "[]")
+            d["ssl_sans"] = json.loads(d.get("ssl_sans") or "[]")
             svc.append(d)
         doc["services"] = svc
         doc["vuln_count"] = sum(len(s["vulns"]) for s in svc)
@@ -437,5 +514,6 @@ class Index:
             d = dict(r)
             d["hostnames"] = json.loads(d.get("hostnames") or "[]")
             d["vulns"] = json.loads(d.get("vulns") or "[]")
+            d["ssl_sans"] = json.loads(d.get("ssl_sans") or "[]")
             out.append(d)
         return out, total

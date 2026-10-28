@@ -12,6 +12,7 @@
       <span class="logo">◎</span> Rennacs
     </a>
     <a class="nav-link" href="{{ url_for('map_view') }}">Map</a>
+    <a class="nav-link" href="{{ url_for('findings_view') }}">Findings</a>
     <form class="searchbar" action="{{ url_for('search') }}" method="get">
       <input type="text" name="q" value="{{ q|default('') }}"
              placeholder="Type to search  —  e.g. port:22 product:nginx"

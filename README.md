@@ -6,6 +6,14 @@ authorized to scan, grabs service banners, fingerprints what's running, indexes 
 results in a local database, and gives you a Shodan-like web UI with a filter query
 language and per-host detail pages.
 
+## Multi-service foundation build
+
+The current development branch adds multi-service TCP profiles, an offline IPv4
+coverage planner, reliable resume/refresh behavior, TLS metadata and evidence-backed
+potential-finding reports. See [the build guide](docs/BUILD.md) for working commands,
+verification and explicit production/UDP limitations. It does not start a global scan
+or install a weekly schedule.
+
 It was built to understand *how* a device search engine works end-to-end:
 
 ```

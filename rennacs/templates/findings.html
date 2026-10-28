@@ -1,0 +1,36 @@
+{% extends "base.html" %}
+{% block title %}Potential findings — Rennacs{% endblock %}
+{% block body %}
+<h1>Potential findings</h1>
+<p class="muted">Evidence-backed advisory correlations, not confirmed vulnerabilities.
+A reported version is not proof of exposure; distribution backports and configuration require review.</p>
+<form class="searchbar" action="{{ url_for('findings_view') }}" method="get">
+  <input name="q" value="{{ q }}" placeholder="Filter findings, e.g. product:OpenSSH">
+  <button type="submit">Filter findings</button>
+</form>
+{% if error %}<div class="empty-note">Query error: {{ error }}</div>{% endif %}
+<p>{{ data.total }} service assessment(s). <a href="{{ url_for('api_findings', q=q) }}">JSON report</a></p>
+{% for f in data.matches %}
+<article class="svc-card">
+  <header class="svc-head">
+    <a href="{{ url_for('host', ip=f.ip) }}">{{ f.ip }}:{{ f.port }}/{{ f.transport }}</a>
+    <span class="tag vuln">potential · low confidence</span>
+    <span>{{ f.evidence.product }} {{ f.evidence.version }}</span>
+  </header>
+  <div class="vuln-box">
+    <p>Observed: {{ f.evidence.observed_at }}. No exploit test performed.</p>
+    <ul>{% for v in f.advisories %}
+      <li><a href="{{ v.reference }}" target="_blank" rel="noopener noreferrer">{{ v.cve }}</a>
+        — {{ v.summary }}{% if v.known_exploited_catalog %} · in known-exploited catalog (not proof about this host){% endif %}</li>
+    {% endfor %}</ul>
+    <strong>Owner approval required</strong>
+    <ol>{% for step in f.remediation.steps %}<li>{{ step }}</li>{% endfor %}</ol>
+    <p class="muted">No automatic changes. Missing observations do not prove a fix.</p>
+  </div>
+</article>
+{% else %}<div class="empty-note">No matching advisory correlations. This does not establish that the assets are secure.</div>{% endfor %}
+<nav>
+{% if page > 1 %}<a href="{{ url_for('findings_view', q=q, page=page-1) }}">Previous</a>{% endif %}
+{% if page * 25 < data.total %}<a href="{{ url_for('findings_view', q=q, page=page+1) }}">Next</a>{% endif %}
+</nav>
+{% endblock %}

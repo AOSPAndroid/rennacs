@@ -14,12 +14,18 @@ from __future__ import annotations
 
 import asyncio
 import ipaddress
+import math
+import socket
 import ssl
+from contextvars import ContextVar
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 
+from cryptography import x509
+from cryptography.x509.oid import NameOID
+
 from . import ports as portlib
-from .authz import NotAuthorized, Policy
+from .authz import Policy
 from .fingerprint import fingerprint
 from .vulns import check as vulncheck
 
@@ -39,6 +45,10 @@ _PROBES = {
 
 _TLS_PORTS = {443, 465, 636, 993, 995, 8443, 9443}
 
+# Preserve HTTP Host / TLS SNI while _grab connects only to an approved IP.
+# Task-local context keeps the established three-argument connector seam intact.
+_TARGET_HOSTNAME: ContextVar[str | None] = ContextVar("target_hostname", default=None)
+
 
 @dataclass
 class ServiceResult:
@@ -57,6 +67,9 @@ class ServiceResult:
     vulns: list = field(default_factory=list)  # list of {cve, severity, summary}
     seen_at: str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
 
+    ssl_sans: list[str] = field(default_factory=list)
+    ssl_trust: str = "not_observed"  # parsed metadata is never proof of trust
+
 
 @dataclass
 class HostResult:
@@ -66,16 +79,22 @@ class HostResult:
     hostnames: list[str] = field(default_factory=list)
     services: list[ServiceResult] = field(default_factory=list)
     seen_at: str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
+    # Attempted scope, not a claim that missing services were confirmed closed.
+    scanned_ports: list[int] | None = None
+
+
+_MAX_DIRECT_HOSTS = 4096
+_MAX_PORT_WORKERS = 200
 
 
 def expand_targets(spec: str) -> list[str]:
-    """Expand a target spec into individual IP strings.
+    """Expand a small explicit scope; use sweep for larger address spaces.
 
-    Accepts a single IP, a CIDR ("192.168.1.0/24"), or a comma-separated mix. For
-    CIDRs the network/broadcast addresses are dropped for IPv4 /31-and-wider blocks.
-    Hostnames are returned as-is (the scanner resolves them at connect time).
+    Count the entire scope before iterating any CIDR. Hostnames are resolved and
+    policy-checked by scan(), never implicitly trusted by this expansion helper.
     """
-    out: list[str] = []
+    parts = []
+    count = 0
     for part in spec.split(","):
         part = part.strip()
         if not part:
@@ -83,20 +102,48 @@ def expand_targets(spec: str) -> list[str]:
         try:
             net = ipaddress.ip_network(part, strict=False)
         except ValueError:
-            out.append(part)   # a hostname
-            continue
-        if net.num_addresses == 1:
-            out.append(str(net.network_address))
+            parts.append(part)
+            count += 1
         else:
-            hosts = list(net.hosts())
-            out.extend(str(h) for h in hosts)
+            parts.append(net)
+            size = net.num_addresses
+            if size > 2:
+                size -= 2 if net.version == 4 else 1
+            count += size
+        if count > _MAX_DIRECT_HOSTS:
+            raise ValueError(f"Direct scans support at most {_MAX_DIRECT_HOSTS} targets; "
+                             "use sweep for larger scopes")
+
+    out: list[str] = []
+    for part in parts:
+        if isinstance(part, str):
+            out.append(part)
+        else:
+            out.extend(str(host) for host in part.hosts())
     return out
 
 
+def _check_timeout(timeout: float) -> None:
+    try:
+        valid = (type(timeout) in (int, float) and timeout > 0
+                 and math.isfinite(timeout))
+    except OverflowError:
+        valid = False
+    if not valid:
+        raise ValueError("timeout must be a finite positive number")
+
+
 async def _grab(host: str, port: int, timeout: float) -> ServiceResult | None:
-    """Connect to one port; return a ServiceResult if open, else None."""
+    """Observe one TCP service, bounding connect/drain/read/close separately.
+
+    None means not_observed, not confirmed closed. TLS metadata is collected
+    without certificate or hostname verification and must not imply trust.
+    """
+    _check_timeout(timeout)
     use_tls = port in _TLS_PORTS
+    server_name = _TARGET_HOSTNAME.get() or host
     ssl_cn = ssl_issuer = ""
+    ssl_sans: list[str] = []
     banner = ""
 
     try:
@@ -105,16 +152,27 @@ async def _grab(host: str, port: int, timeout: float) -> ServiceResult | None:
             ctx.check_hostname = False
             ctx.verify_mode = ssl.CERT_NONE
             reader, writer = await asyncio.wait_for(
-                asyncio.open_connection(host, port, ssl=ctx), timeout
+                asyncio.open_connection(host, port, ssl=ctx,
+                                        server_hostname=server_name), timeout
             )
             # Pull the peer certificate subject / issuer for the SSL panel.
             try:
                 sslobj = writer.get_extra_info("ssl_object")
-                cert = sslobj.getpeercert() if sslobj else None
-                if cert:
-                    ssl_cn = _rdn(cert.get("subject"), "commonName")
-                    ssl_issuer = _rdn(cert.get("issuer"), "organizationName") or \
-                        _rdn(cert.get("issuer"), "commonName")
+                der = sslobj.getpeercert(binary_form=True) if sslobj else None
+                if der:
+                    cert = x509.load_der_x509_certificate(der)
+                    common_names = cert.subject.get_attributes_for_oid(NameOID.COMMON_NAME)
+                    issuers = (cert.issuer.get_attributes_for_oid(NameOID.ORGANIZATION_NAME)
+                               or cert.issuer.get_attributes_for_oid(NameOID.COMMON_NAME))
+                    ssl_cn = common_names[0].value if common_names else ""
+                    ssl_issuer = issuers[0].value if issuers else ""
+                    try:
+                        sans = cert.extensions.get_extension_for_class(
+                            x509.SubjectAlternativeName).value
+                        ssl_sans = [str(name.value) for name in sans
+                                    if isinstance(name, (x509.DNSName, x509.IPAddress))]
+                    except x509.ExtensionNotFound:
+                        pass
             except Exception:
                 pass
         else:
@@ -128,21 +186,24 @@ async def _grab(host: str, port: int, timeout: float) -> ServiceResult | None:
         probe = _PROBES.get(port)
         if probe is not None:
             try:
-                writer.write(probe % host.encode() if b"%s" in probe else probe)
-                await writer.drain()
+                writer.write(probe % server_name.encode("idna") if b"%s" in probe else probe)
+                await asyncio.wait_for(writer.drain(), timeout)
             except Exception:
                 pass
         try:
             data = await asyncio.wait_for(reader.read(2048), timeout)
             banner = data.decode("latin-1", "replace").strip()
-        except asyncio.TimeoutError:
+        except (asyncio.TimeoutError, OSError):
             banner = ""
     finally:
         writer.close()
         try:
-            await writer.wait_closed()
+            await asyncio.wait_for(writer.wait_closed(), timeout)
+        except asyncio.CancelledError:
+            writer.transport.abort()
+            raise
         except Exception:
-            pass
+            writer.transport.abort()
 
     svc = ServiceResult(
         port=port,
@@ -151,36 +212,45 @@ async def _grab(host: str, port: int, timeout: float) -> ServiceResult | None:
         has_ssl=use_tls,
         ssl_cn=ssl_cn,
         ssl_issuer=ssl_issuer,
+        ssl_sans=ssl_sans,
+        ssl_trust="unverified" if use_tls else "not_observed",
     )
     fingerprint(svc)   # fills product / version / os / refines service
     svc.vulns = [v.as_dict() for v in vulncheck(svc.product, svc.version)]
     return svc
 
 
-def _rdn(name, key: str) -> str:
-    """Pull a value (by key) out of a getpeercert() subject/issuer tuple-of-tuples."""
-    if not name:
-        return ""
-    for rdn in name:
-        for k, v in rdn:
-            if k == key:
-                return v
-    return ""
-
-
 async def scan_host(host: str, port_list: list[int], *, timeout: float = 2.0,
                     concurrency: int = 200) -> HostResult:
-    """Scan one host across ``port_list`` and return a HostResult (open ports only)."""
-    sem = asyncio.Semaphore(concurrency)
+    """Observe selected ports using at most 200 port workers, not one task/port.
 
-    async def one(p: int):
-        async with sem:
-            return await _grab(host, p, timeout)
+    This low-level connector takes a concrete destination; scan() supplies the
+    policy boundary. scanned_ports records attempted scope, not confirmed closure.
+    """
+    _check_timeout(timeout)
+    if type(concurrency) is not int or concurrency <= 0:
+        raise ValueError("concurrency must be a positive integer")
+    ports = sorted(set(port_list))
+    pending = iter(ports)
+    services: list[ServiceResult] = []
 
-    results = await asyncio.gather(*(one(p) for p in port_list))
-    services = [r for r in results if r is not None]
+    async def worker():
+        for port in pending:
+            result = await _grab(host, port, timeout)
+            if result is not None:
+                services.append(result)
+
+    workers = [asyncio.create_task(worker())
+               for _ in range(min(concurrency, _MAX_PORT_WORKERS, len(ports)))]
+    try:
+        await asyncio.gather(*workers)
+    finally:
+        for task in workers:
+            if not task.done():
+                task.cancel()
+        await asyncio.gather(*workers, return_exceptions=True)
     services.sort(key=lambda s: s.port)
-    return HostResult(ip=host, services=services)
+    return HostResult(ip=host, services=services, scanned_ports=ports)
 
 
 async def scan(targets: str, port_spec: str = "top100", *, policy: Policy | None = None,
@@ -188,47 +258,70 @@ async def scan(targets: str, port_spec: str = "top100", *, policy: Policy | None
                on_host=None) -> list[HostResult]:
     """Scan every host in ``targets`` across ``port_spec``.
 
-    ``policy`` gates which hosts may be scanned. ``on_host`` is an optional callback
-    invoked with each HostResult as it completes (used by the CLI for live output and
-    to stream rows into the index).
+    Resolve and policy-check every destination before probing any of them; only
+    checked IPs reach the connector. Hostnames remain observational DNS metadata
+    and supply HTTP Host / TLS SNI (the first alias for a shared destination).
+
+    ``on_host`` receives ALL completed HostResults, including empty observations;
+    the returned list contains only live hosts. Direct scopes are limited to 4096
+    targets; larger address spaces belong in sweep().
     """
+    _check_timeout(timeout)
+    if type(host_concurrency) is not int or host_concurrency <= 0:
+        raise ValueError("host_concurrency must be a positive integer")
     policy = policy or Policy()
     port_list = portlib.resolve(port_spec)
     hosts = expand_targets(targets)
 
-    allowed: list[str] = []
+    allowed: dict[str, list[str]] = {}
+    loop = asyncio.get_running_loop()
     for h in hosts:
         try:
-            # Hostnames can't be policy-checked until resolved; allow and let the OS
-            # resolve. For lab/classroom use targets are usually literal IPs.
-            ipaddress.ip_address(h)
-            policy.check(h)
-        except NotAuthorized:
-            raise
+            destinations = [str(ipaddress.ip_address(h))]
         except ValueError:
-            pass  # hostname — allowed through
-        allowed.append(h)
+            records = await asyncio.wait_for(
+                loop.getaddrinfo(h, None, type=socket.SOCK_STREAM,
+                                 proto=socket.IPPROTO_TCP), timeout
+            )
+            destinations = list(dict.fromkeys(
+                str(ipaddress.ip_address(record[4][0])) for record in records
+            ))
+            if not destinations:
+                raise OSError(f"No TCP addresses resolved for {h}")
+        for destination in destinations:
+            policy.check(destination)
+            names = allowed.setdefault(destination, [])
+            if len(allowed) > _MAX_DIRECT_HOSTS:
+                raise ValueError(f"Direct scans support at most {_MAX_DIRECT_HOSTS} targets; "
+                                 "use sweep for larger scopes")
+            if h != destination and h not in names:
+                names.append(h)
 
     sem = asyncio.Semaphore(host_concurrency)
     out: list[HostResult] = []
 
     async def one(h: str):
         async with sem:
-            hr = await scan_host(h, port_list, timeout=timeout)
+            token = _TARGET_HOSTNAME.set(allowed[h][0] if allowed[h] else None)
+            try:
+                hr = await scan_host(h, port_list, timeout=timeout)
+            finally:
+                _TARGET_HOSTNAME.reset(token)
+            hr.hostnames = allowed[h]
             if hr.services:           # only keep hosts that answered
                 out.append(hr)
-                if on_host:
-                    on_host(hr)
+            if on_host:
+                on_host(hr)
             return hr
 
-    await asyncio.gather(*(one(h) for h in allowed))
-    out.sort(key=lambda hr: ipaddress.ip_address(hr.ip) if _is_ip(hr.ip) else hr.ip)
-    return out
-
-
-def _is_ip(s: str) -> bool:
+    tasks = [asyncio.create_task(one(host)) for host in allowed]
     try:
-        ipaddress.ip_address(s)
-        return True
-    except ValueError:
-        return False
+        await asyncio.gather(*tasks)
+    finally:
+        for task in tasks:
+            if not task.done():
+                task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+    out.sort(key=lambda hr: (ipaddress.ip_address(hr.ip).version,
+                            int(ipaddress.ip_address(hr.ip))))
+    return out
