@@ -92,7 +92,23 @@ def assess_service(row: dict) -> dict:
     }
 
 
-def report(index, query: str = "", *, limit: int = 100, offset: int = 0) -> dict:
+def rank_key(match: dict) -> tuple:
+    """Attack priority: known-exploited first, then CVSS, then a confirmed kernel.
+
+    A KEV entry outranks a higher CVSS because it is being exploited in the wild; a
+    confirmed kernel string outranks an inferred one because it is real evidence.
+    """
+    advisories = match.get("advisories") or []
+    kev = any(a.get("known_exploited_catalog") for a in advisories)
+    cvss = max((a.get("cvss") or 0 for a in advisories), default=0)
+    service = match.get("service") or {}
+    confidence = service.get("kernel_confidence") or ""
+    return (not kev, -(cvss or 0), confidence != "confirmed", str(match.get("ip")),
+            int(match.get("port") or 0))
+
+
+def report(index, query: str = "", *, limit: int = 100, offset: int = 0,
+           ranked: bool = False) -> dict:
     """Paginate service assessments, not individual CVEs; cache/local DB only."""
     from .query import compile_query
 
@@ -102,6 +118,8 @@ def report(index, query: str = "", *, limit: int = 100, offset: int = 0) -> dict
     rows, total = index.search(f"({where}) AND s.vuln_ids<>''", params,
                                limit=limit, offset=offset)
     matches = [assess_service(row) for row in rows]
+    if ranked:
+        matches.sort(key=rank_key)
     return {
         "query": query, "unit": "service_assessments", "total": total,
         "count": len(matches), "offset": offset, "matches": matches,

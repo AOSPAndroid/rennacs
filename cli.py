@@ -75,6 +75,208 @@ def cmd_scan(args) -> int:
     return 0
 
 
+def cmd_origin(args) -> int:
+    """Certificate-transparency harvest, then split edge from origin candidates.
+
+    Pure DNS plus one CT lookup: no packets reach the target, so this needs no
+    authorization assertion even for a public domain.
+    """
+    from rennacs import ct
+    from rennacs.cdn import EdgeMap
+
+    edges = EdgeMap(path=args.cache)
+    if args.refresh or edges.stale:
+        got = edges.refresh()
+        if got:
+            print(f"[edge] refreshed ranges: {got}")
+        elif args.refresh:
+            print("[edge] refresh failed; using cached/seed ranges", file=sys.stderr)
+
+    print(f"Harvesting certificate transparency for {args.domain} ...")
+    try:
+        names = ct.harvest(args.domain)
+    except Exception as exc:  # noqa: BLE001 - crt.sh is frequently slow or down
+        print(f"[FAILED] CT harvest: {exc}", file=sys.stderr)
+        return 1
+    if not names:
+        print("No names found.")
+        return 0
+    print(f"{len(names)} name(s) in CT logs; resolving ...")
+
+    classes = ct.classify(names, edges)
+    origins, protected = ct.split(classes)
+    unresolved = [c for c in classes if not c.addresses]
+
+    print(f"\n=== ORIGIN CANDIDATES ({len(origins)}) — no edge in front ===")
+    for c in sorted(origins, key=lambda c: c.name):
+        print(f"  {c.name:<45} {', '.join(c.addresses)}")
+    print(f"\n=== EDGE-PROTECTED ({len(protected)}) ===")
+    by_provider: dict[str, int] = {}
+    for c in protected:
+        by_provider[c.edge or "?"] = by_provider.get(c.edge or "?", 0) + 1
+    for provider, n in sorted(by_provider.items(), key=lambda kv: -kv[1]):
+        print(f"  {provider:<14} {n} host(s)")
+    if unresolved:
+        print(f"\n{len(unresolved)} name(s) did not resolve (dead or internal-only).")
+
+    if args.index and origins:
+        idx = Index(args.db)
+        try:
+            for c in origins:
+                idx.upsert_host(scanner.HostResult(ip=c.addresses[0], hostnames=[c.name]))
+        finally:
+            idx.close()
+        print(f"\nIndexed {len(origins)} origin host(s) into {args.db}.")
+    print("\nNext: scan an origin IP directly — it has no WAF in front of it.")
+    return 0
+
+
+def cmd_udp(args) -> int:
+    """UDP probes: SNMP sysDescr, NTP, DNS version.bind, mDNS."""
+    from rennacs import kernel as kernelmod
+    from rennacs import udp as udpmod
+
+    policy = Policy(authorized=args.i_am_authorized)
+    try:
+        policy.check(args.target)
+    except NotAuthorized as e:
+        print(f"\n[REFUSED] {e}", file=sys.stderr)
+        return 2
+
+    ports = [int(p) for p in args.ports.split(",")] if args.ports else None
+    answers = udpmod.scan(args.target, ports, timeout=args.timeout)
+    if not answers:
+        print("No UDP answers (lossy protocol; a miss is not a closed port).")
+        return 0
+
+    idx = Index(args.db)
+    services = []
+    try:
+        for a in answers:
+            hint = kernelmod.from_sysdescr(a.text) if a.service == "snmp" else None
+            svc = scanner.ServiceResult(
+                port=a.port, transport="udp", service=a.service, banner=a.text[:2000],
+            )
+            if hint is not None:
+                svc.kernel = hint.kernel
+                svc.kernel_distro = hint.distro
+                svc.kernel_confidence = hint.confidence
+                svc.kernel_source = hint.source
+            services.append(svc)
+            print(f"  udp/{a.port:<6} {a.service:<6} {a.text[:110].strip()!r}")
+            if hint is not None:
+                print(f"           kernel={hint.kernel or '-'} distro={hint.distro or '-'} "
+                      f"({hint.confidence})")
+        idx.upsert_host(scanner.HostResult(ip=args.target, services=services))
+    finally:
+        idx.close()
+    print(f"\n{len(answers)} UDP service(s) indexed into {args.db}.")
+    return 0
+
+
+def cmd_probe(args) -> int:
+    """Prove an origin IP serves a vhost, and identify what is on it."""
+    from rennacs import attack
+
+    ident = attack.fetch(args.ip, args.host, args.port, args.path, tls=not args.no_tls)
+    print(f"{args.ip}:{args.port} Host: {args.host}")
+    print(f"  status   {ident.status or '-'}  {ident.error}")
+    if ident.server:
+        print(f"  server   {ident.server}")
+    if ident.title:
+        print(f"  title    {ident.title}")
+    if ident.favicon:
+        print(f"  favicon  {ident.favicon}")
+    if ident.tls_cn:
+        print(f"  tls cn   {ident.tls_cn}")
+    if ident.location:
+        print(f"  location {ident.location}")
+    if args.edge:
+        edge = attack.fetch(args.edge, args.host, args.port, args.path, tls=not args.no_tls)
+        verdict = attack.compare(edge, ident)
+        print(f"\n  vs edge {args.edge}: {'SAME APP' if verdict['same'] else 'different'}"
+              f" — {', '.join(verdict['reasons'])}")
+    return 0 if ident.reachable else 1
+
+
+def cmd_hunt(args) -> int:
+    """One-shot: CT harvest -> origin split -> prove -> scan -> rank."""
+    from rennacs import attack, ct
+    from rennacs.cdn import EdgeMap
+
+    edges = EdgeMap(path=args.cache)
+    if edges.stale:
+        edges.refresh()
+
+    print(f"[1/4] harvesting CT for {args.domain}")
+    names = ct.harvest(args.domain)
+    classes = ct.classify(names, edges)
+    origins, protected = ct.split(classes)
+    print(f"      {len(names)} names, {len(origins)} origin candidate(s), "
+          f"{len(protected)} edge-protected")
+
+    if not origins:
+        print("No origin candidates; nothing to hunt.")
+        return 0
+
+    print("[2/4] proving candidates against the apex vhost")
+    confirmed = []
+    for c in origins:
+        for ip in c.addresses[:2]:
+            if ":" in ip and not args.ipv6:
+                continue
+            ident = attack.fetch(ip, args.domain, args.port, tls=not args.no_tls,
+                                 timeout=args.timeout)
+            if ident.serves_vhost:
+                confirmed.append((c.name, ip, ident))
+                print(f"      LIVE {c.name} -> {ip} [{ident.status}] {ident.title[:60]}")
+    if not confirmed:
+        print("      none answered for the apex vhost (they may be separate apps).")
+        if not args.force:
+            return 0
+
+    targets = sorted({ip for _, ip, _ in confirmed})
+    print(f"[3/4] scanning {len(targets)} confirmed origin(s), ports={args.ports}")
+    policy = Policy(authorized=True)
+    idx = Index(args.db)
+    total = {"services": 0}
+    found_ids: set[str] = set()
+
+    def on_host(hr):
+        idx.upsert_host(hr)
+        total["services"] += len(hr.services)
+        for s in hr.services:
+            for v in s.vulns:
+                if v.get("cve"):
+                    found_ids.add(v["cve"])
+            print(f"      {hr.ip:<16} {s.port:<6} {s.product or s.service or '?'}"
+                  f"{' ' + s.version if s.version else ''}")
+
+    try:
+        for ip in targets:
+            asyncio.run(scanner.scan(ip, args.ports, policy=policy,
+                                     timeout=args.timeout, on_host=on_host))
+    finally:
+        idx.close()
+
+    print(f"[4/4] {total['services']} service(s) indexed into {args.db}")
+
+    # Pull advisories for the CVEs the fingerprint rules already flagged, so the
+    # ranked report has something to rank. Bounded and best-effort.
+    if found_ids and not args.no_enrich:
+        print(f"[+] fetching {len(found_ids)} advisory record(s) from cve.now")
+        idx2 = Index(args.db)
+        try:
+            idx2.catalog.fetch_ids(sorted(found_ids), max_requests=args.enrich_limit)
+            idx2.reassess_catalog("")
+        except Exception as exc:  # noqa: BLE001 - enrichment is optional
+            print(f"    enrichment failed: {exc}", file=sys.stderr)
+        finally:
+            idx2.close()
+    print("      next: python cli.py findings --rank")
+    return 0
+
+
 def cmd_sweep(args) -> int:
     """Network-wide sweep: the Shodan-style crawler, bounded to authorized scope."""
     from rennacs import sweep as sweepmod
@@ -251,7 +453,8 @@ def cmd_findings(args) -> int:
 
     idx = Index(args.db)
     try:
-        data = report(idx, args.query, limit=args.limit, offset=args.offset)
+        data = report(idx, args.query, limit=args.limit, offset=args.offset,
+                      ranked=args.rank)
     except (ValueError, QueryError) as exc:
         print(f"report error: {exc}", file=sys.stderr)
         return 2
@@ -264,8 +467,11 @@ def cmd_findings(args) -> int:
         print(f"{data['total']} service assessment(s); showing {data['count']}.")
         for finding in data["matches"]:
             cves = ", ".join(v["cve"] for v in finding["advisories"])
+            kev = " [KEV]" if any(v.get("known_exploited_catalog")
+                                  for v in finding["advisories"]) else ""
+            cvss = max((v.get("cvss") or 0 for v in finding["advisories"]), default=0)
             print(f"  {finding['ip']}:{finding['port']}/{finding['transport']} "
-                  f"potential / low confidence  {cves}")
+                  f"potential / low confidence  cvss={cvss or '-'}{kev}  {cves}")
     return 0
 
 
@@ -564,6 +770,48 @@ def build_parser() -> argparse.ArgumentParser:
                    help="assert permission to scan public targets")
     p.set_defaults(func=cmd_scan)
 
+    p = sub.add_parser("origin", help="CT harvest + edge/origin split for a domain")
+    p.add_argument("domain", help="apex domain, e.g. example.com")
+    p.add_argument("--refresh", action="store_true",
+                   help="force-refresh the CDN range cache from provider lists")
+    p.add_argument("--cache", default="cdn-ranges.json",
+                   help="CDN range cache file (default: cdn-ranges.json)")
+    p.add_argument("--index", action="store_true",
+                   help="index the origin candidates as hosts")
+    p.set_defaults(func=cmd_origin)
+
+    p = sub.add_parser("udp", help="UDP probes: SNMP sysDescr, NTP, DNS, mDNS")
+    p.add_argument("target", help="IP or hostname")
+    p.add_argument("-p", "--ports", default="", help="comma list (default: 161,123,53,5353)")
+    p.add_argument("-t", "--timeout", type=float, default=2.5)
+    p.add_argument("--i-am-authorized", action="store_true",
+                   help="assert permission to probe a public target")
+    p.set_defaults(func=cmd_udp)
+
+    p = sub.add_parser("probe", help="prove an origin IP serves a vhost (Host/SNI)")
+    p.add_argument("ip", help="origin IP")
+    p.add_argument("--host", required=True, help="vhost to present as Host and SNI")
+    p.add_argument("--port", type=int, default=443)
+    p.add_argument("--path", default="/")
+    p.add_argument("--no-tls", action="store_true", help="plain HTTP instead of HTTPS")
+    p.add_argument("--edge", help="edge IP to compare identity against")
+    p.set_defaults(func=cmd_probe)
+
+    p = sub.add_parser("hunt", help="one-shot: CT -> origins -> prove -> scan -> rank")
+    p.add_argument("domain", help="apex domain")
+    p.add_argument("-p", "--ports", default="web", help="TCP port set (default: web)")
+    p.add_argument("--port", type=int, default=443, help="port used while proving")
+    p.add_argument("-t", "--timeout", type=float, default=4.0)
+    p.add_argument("--no-tls", action="store_true")
+    p.add_argument("--ipv6", action="store_true", help="also try IPv6 candidates")
+    p.add_argument("--force", action="store_true", help="scan even if no candidate proves")
+    p.add_argument("--cache", default="cdn-ranges.json")
+    p.add_argument("--no-enrich", action="store_true",
+                   help="skip pulling advisories for flagged CVEs")
+    p.add_argument("--enrich-limit", type=int, default=60,
+                   help="max advisory lookups after a hunt")
+    p.set_defaults(func=cmd_hunt)
+
     p = sub.add_parser("sweep", help="network-wide sweep (Shodan-style crawler)")
     p.add_argument("scope", nargs="?", default="",
                    help="CIDR or comma list, e.g. 192.168.0.0/16 (omit with --resume)")
@@ -607,6 +855,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--limit", type=int, default=100)
     p.add_argument("--offset", type=int, default=0)
     p.add_argument("--json", action="store_true", help="machine-readable local report")
+    p.add_argument("--rank", action="store_true",
+                   help="order by attack priority: KEV, then CVSS, then confirmed kernel")
     p.set_defaults(func=cmd_findings)
 
     p = sub.add_parser("catalog", help="local advisory catalog and offline reassessment")

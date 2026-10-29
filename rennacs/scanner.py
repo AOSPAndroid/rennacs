@@ -27,6 +27,7 @@ from cryptography.x509.oid import NameOID
 from . import ports as portlib
 from .authz import Policy
 from .fingerprint import fingerprint
+from . import kernel
 from .vulns import check as vulncheck
 
 # Probes we send for services that stay silent until spoken to. Keyed by port; the
@@ -69,6 +70,14 @@ class ServiceResult:
 
     ssl_sans: list[str] = field(default_factory=list)
     ssl_trust: str = "not_observed"  # parsed metadata is never proof of trust
+
+    # Kernel/distro hint. ``confirmed`` = read from a uname-like string,
+    # ``inferred`` = derived from a distro revision in the banner.
+    kernel: str = ""
+    kernel_distro: str = ""
+    kernel_revision: str = ""
+    kernel_confidence: str = ""
+    kernel_source: str = ""
 
 
 @dataclass
@@ -216,6 +225,13 @@ async def _grab(host: str, port: int, timeout: float) -> ServiceResult | None:
         ssl_trust="unverified" if use_tls else "not_observed",
     )
     fingerprint(svc)   # fills product / version / os / refines service
+    hint = kernel.extract(ssh_banner=banner if svc.service == "ssh" else "")
+    if hint is not None:
+        svc.kernel = hint.kernel
+        svc.kernel_distro = hint.distro
+        svc.kernel_revision = hint.revision
+        svc.kernel_confidence = hint.confidence
+        svc.kernel_source = hint.source
     svc.vulns = [v.as_dict() for v in vulncheck(svc.product, svc.version)]
     return svc
 

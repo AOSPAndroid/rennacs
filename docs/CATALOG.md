@@ -196,3 +196,19 @@ inventories. A free no-key endpoint does not automatically authorize resale.
 Deterministic catalog CLI/API/UI tests use synthetic advisory data and mocked
 outbound fetches over real SQLite, Index, Flask and command-line seams. They do
 not establish upstream availability or production performance.
+
+## Attacker workflow: hunt
+
+`hunt` chains the recon modules into one pass and leaves a ranked report:
+
+```bash
+python cli.py hunt example.com -p web          # CT -> origins -> prove -> scan -> rank
+python cli.py findings --rank                  # KEV first, then CVSS, then confirmed kernel
+python cli.py probe 203.0.113.9 --host www.example.com --edge 104.16.1.1
+python cli.py udp 203.0.113.9                  # SNMP sysDescr -> kernel -> kernel CVEs
+```
+
+`probe` presents the vhost over SNI and Host and compares identity (title, favicon,
+server) against the edge. An origin is only "confirmed" when it answers the vhost;
+everything else is a DNS guess. Kernel CVEs only match when a kernel string was read
+(`confirmed`) or a distro revision was inferred — never from a bare product version.

@@ -171,12 +171,18 @@ class Index:
                           ("ssl_trust", "TEXT DEFAULT 'not_observed'"),
                           ("catalog_vulns", "TEXT DEFAULT '[]'"),
                           ("catalog_checked_at", "TEXT"),
-                          ("catalog_revision", "INTEGER DEFAULT 0")):
+                          ("catalog_revision", "INTEGER DEFAULT 0"),
+                          ("kernel", "TEXT"),
+                          ("kernel_distro", "TEXT"),
+                          ("kernel_revision", "TEXT"),
+                          ("kernel_confidence", "TEXT"),
+                          ("kernel_source", "TEXT")):
             if name not in have:
                 self.conn.execute(f"ALTER TABLE services ADD COLUMN {name} {ddl}")
         have_h = {r["name"] for r in self.conn.execute("PRAGMA table_info(hosts)")}
-        if "tags" not in have_h:
-            self.conn.execute("ALTER TABLE hosts ADD COLUMN tags TEXT")
+        for name, ddl in (("tags", "TEXT"), ("edge", "TEXT")):
+            if name not in have_h:
+                self.conn.execute(f"ALTER TABLE hosts ADD COLUMN {name} {ddl}")
         have_j = {r["name"] for r in self.conn.execute("PRAGMA table_info(scan_jobs)")}
         for name, ddl in (("resume_at", "INTEGER DEFAULT 0"), ("config", "TEXT")):
             if name not in have_j:
@@ -241,8 +247,17 @@ class Index:
             return  # do not store billions of empty/unknown address documents
         geo = enrich(host.ip)
         revision = self.catalog.revision()
-        matches = [self._catalog_matches(s.product, s.version, revision=revision)
-                   for s in host.services]
+        matches = []
+        for s in host.services:
+            found = self._catalog_matches(s.product, s.version, revision=revision)
+            if s.kernel:
+                # A kernel string is a host fact, not a service product, so it can
+                # never match through the product index. Correlate it explicitly or
+                # kernel CVEs stay invisible.
+                seen = {m["cve"] for m in found}
+                found += [m for m in self._catalog_matches("Linux", s.kernel, revision=revision)
+                          if m["cve"] not in seen]
+            matches.append(found)
         checked_at = datetime.now(timezone.utc).isoformat()
         with self._tx():
             previous = self.conn.execute(
@@ -289,20 +304,25 @@ class Index:
                 vuln_ids = " ".join(v["cve"] for v in merged)
                 search = " ".join(filter(None, [
                     s.banner, s.product, s.version, s.service, s.os, s.ssl_cn,
-                    s.ssl_issuer, geo.org, geo.country, geo.city, vuln_ids,
+                    s.ssl_issuer, s.kernel, s.kernel_distro, geo.org, geo.country,
+                    geo.city, vuln_ids,
                 ])).lower()
                 self.conn.execute(
                     """INSERT INTO services(ip, ip_int, port, transport, service,
                            product, version, os, has_ssl, ssl_cn, ssl_issuer, banner,
                            vulns, vuln_ids, search_text, seen_at, ssl_sans, ssl_trust,
-                           catalog_vulns, catalog_checked_at, catalog_revision, kev)
-                       VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                           catalog_vulns, catalog_checked_at, catalog_revision, kev,
+                           kernel, kernel_distro, kernel_revision, kernel_confidence,
+                           kernel_source)
+                       VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                     (host.ip, ip_int, s.port, s.transport, s.service, s.product,
                      s.version, s.os, 1 if s.has_ssl else 0, s.ssl_cn, s.ssl_issuer,
                      s.banner, json.dumps(s.vulns), vuln_ids, search, s.seen_at,
                      json.dumps(s.ssl_sans), "unverified" if s.has_ssl else "not_observed",
                      json.dumps(catalog_matches), checked_at, revision,
-                     int(any(v.get("kev") for v in merged))),
+                     int(any(v.get("kev") for v in merged)),
+                     s.kernel, s.kernel_distro, s.kernel_revision,
+                     s.kernel_confidence, s.kernel_source),
                 )
                 self.conn.execute(
                     """INSERT INTO service_observations
@@ -338,8 +358,16 @@ class Index:
         tag_text = " ".join(tags)
         revision = self.catalog.revision()
         services = doc.get("services", [])
-        matches = [self._catalog_matches(s.get("product", ""), s.get("version", ""),
-                                         revision=revision) for s in services]
+        matches = []
+        for s in services:
+            found = self._catalog_matches(s.get("product", ""), s.get("version", ""),
+                                          revision=revision)
+            if s.get("kernel"):
+                seen = {m["cve"] for m in found}
+                found += [m for m in self._catalog_matches("Linux", s["kernel"],
+                                                           revision=revision)
+                          if m["cve"] not in seen]
+            matches.append(found)
         checked_at = datetime.now(timezone.utc).isoformat()
         with self._tx():
             self.conn.execute(
@@ -369,6 +397,7 @@ class Index:
                 search = " ".join(filter(None, [
                     s.get("banner", ""), s.get("product", ""), s.get("version", ""),
                     s.get("service", ""), s.get("os", ""), s.get("ssl_cn", ""),
+                    s.get("kernel", ""), s.get("kernel_distro", ""),
                     doc.get("org", "") or geo.org, doc.get("country", "") or geo.country,
                     vuln_ids, tag_text,
                 ])).lower()
@@ -376,8 +405,10 @@ class Index:
                     """INSERT INTO services(ip, ip_int, port, transport, service,
                            product, version, os, has_ssl, ssl_cn, ssl_issuer, banner,
                            vulns, vuln_ids, search_text, seen_at, ssl_sans, ssl_trust,
-                           catalog_vulns, catalog_checked_at, catalog_revision, kev)
-                       VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                           catalog_vulns, catalog_checked_at, catalog_revision, kev,
+                           kernel, kernel_distro, kernel_revision, kernel_confidence,
+                           kernel_source)
+                       VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                     (doc["ip"], ip_int, s["port"], s.get("transport", "tcp"),
                      s.get("service", ""), s.get("product", ""), s.get("version", ""),
                      s.get("os", ""), 1 if s.get("has_ssl") else 0,
@@ -386,7 +417,10 @@ class Index:
                      json.dumps(s.get("ssl_sans", [])),
                      "unverified" if s.get("has_ssl") else "not_observed",
                      json.dumps(catalog_matches), checked_at, revision,
-                     int(any(v.get("kev") for v in merged))),
+                     int(any(v.get("kev") for v in merged)),
+                     s.get("kernel", ""), s.get("kernel_distro", ""),
+                     s.get("kernel_revision", ""), s.get("kernel_confidence", ""),
+                     s.get("kernel_source", "")),
                 )
 
     # -- offline advisory correlation --------------------------------------------
@@ -406,7 +440,7 @@ class Index:
         where, params = compile_query(query)
         revision = self.catalog.revision()
         rows = self.conn.execute(
-            f"""SELECT s.id,s.product,s.version FROM services s JOIN hosts h USING(ip)
+            f"""SELECT s.id,s.product,s.version,s.kernel FROM services s JOIN hosts h USING(ip)
                 WHERE s.id>? AND ({where}) ORDER BY s.id LIMIT ?""",
             [after_id, *params, limit + 1],
         ).fetchall()
@@ -415,6 +449,11 @@ class Index:
                   "catalog_revision": revision}
         for row in rows[:limit]:
             matches = self._catalog_matches(row["product"], row["version"], revision=revision)
+            if row["kernel"]:
+                seen = {m["cve"] for m in matches}
+                matches += [m for m in self._catalog_matches("Linux", row["kernel"],
+                                                             revision=revision)
+                            if m["cve"] not in seen]
             self.update_catalog_matches(row["id"], matches, revision=revision)
             result["processed"] += 1
             result["matched_services"] += bool(matches)
@@ -444,7 +483,7 @@ class Index:
         tags = " ".join(json.loads(data.get("tags") or "[]"))
         search = " ".join(str(data.get(key) or "") for key in (
             "banner", "product", "version", "service", "os", "ssl_cn",
-            "ssl_issuer", "org", "country", "city",
+            "ssl_issuer", "kernel", "kernel_distro", "org", "country", "city",
         )) + " " + tags + " " + ids
         with self._tx():
             self.conn.execute(
