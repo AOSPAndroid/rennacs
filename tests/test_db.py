@@ -1,4 +1,5 @@
 """Tests for the SQLite index: storage, search, stats and the map query."""
+from tests.inventory_fixture import with_test_source
 
 import pytest
 
@@ -64,12 +65,12 @@ def test_vuln_specific_cve(seeded_index):
 
 
 def test_rescan_replaces_services(empty_index):
-    empty_index.insert_raw({"ip": "10.9.9.9",
-                            "services": [{"port": 80, "service": "http"}]})
+    empty_index.insert_raw(with_test_source({"ip": "10.9.9.9",
+                            "services": [{"port": 80, "service": "http"}]}))
     assert empty_index.host("10.9.9.9")["services"][0]["port"] == 80
     # re-insert with a different port set; the old one must be gone
-    empty_index.insert_raw({"ip": "10.9.9.9",
-                            "services": [{"port": 443, "service": "https"}]})
+    empty_index.insert_raw(with_test_source({"ip": "10.9.9.9",
+                            "services": [{"port": 443, "service": "https"}]}))
     ports = [s["port"] for s in empty_index.host("10.9.9.9")["services"]]
     assert ports == [443]
 

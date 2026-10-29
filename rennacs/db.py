@@ -21,7 +21,9 @@ from contextlib import contextmanager
 from dataclasses import asdict
 from datetime import datetime, timezone
 
+from .catalog import valid_id
 from .geoip import enrich
+from .provenance import is_sourced, scan_provenance, valid_timestamp
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS hosts (
@@ -92,6 +94,14 @@ CREATE TABLE IF NOT EXISTS scan_jobs (
     updated_at  TEXT,
     finished_at TEXT
 );
+CREATE TABLE IF NOT EXISTS quarantined_records (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    record_type TEXT NOT NULL,
+    ip TEXT NOT NULL,
+    payload TEXT NOT NULL,
+    reason TEXT NOT NULL,
+    quarantined_at TEXT NOT NULL
+);
 """
 
 # Indexes are created AFTER the column migration, so an old DB (missing ip_int) gets
@@ -134,11 +144,17 @@ def _merge_advisories(legacy: list, catalog: list) -> list[dict]:
 
 def _service_doc(row) -> dict:
     doc = dict(row)
+    doc["provenance"] = json.loads(doc["provenance"])
     legacy = json.loads(doc.get("vulns") or "[]")
     doc["catalog_vulns"] = json.loads(doc.get("catalog_vulns") or "[]")
     doc["vulns"] = _merge_advisories(legacy, doc["catalog_vulns"])
     doc["ssl_sans"] = json.loads(doc.get("ssl_sans") or "[]")
     return doc
+
+
+def _advisory_ids(advisories: list) -> list[str]:
+    """Index valid tokens verbatim; retain malformed source values only in JSON."""
+    return [item["cve"] for item in advisories if valid_id(item.get("cve"))]
 
 
 class Index:
@@ -150,6 +166,19 @@ class Index:
         self.conn.executescript(SCHEMA)
         self._migrate()                     # add any columns an old DB is missing
         self.conn.executescript(INDEXES)    # then index them
+        self.conn.create_function("sourced_provenance", 1, is_sourced, deterministic=True)
+        # Every public inventory read uses these views. Validation is evaluated
+        # on read as well, so malformed/tampered metadata cannot leak via counts.
+        self.conn.executescript("""
+            CREATE TEMP VIEW sourced_hosts AS
+                SELECT * FROM hosts WHERE sourced_provenance(provenance);
+            CREATE TEMP VIEW sourced_services AS
+                SELECT s.* FROM services s JOIN sourced_hosts h USING(ip)
+                WHERE sourced_provenance(s.provenance);
+            CREATE TEMP VIEW sourced_observations AS
+                SELECT o.* FROM service_observations o JOIN sourced_hosts h USING(ip)
+                WHERE sourced_provenance(o.provenance);
+        """)
         # Establish catalog tables before any caller-owned transaction can begin.
         from .catalog import Catalog
         self._catalog = Catalog(connection=self.conn)
@@ -177,6 +206,14 @@ class Index:
         have_h = {r["name"] for r in self.conn.execute("PRAGMA table_info(hosts)")}
         if "tags" not in have_h:
             self.conn.execute("ALTER TABLE hosts ADD COLUMN tags TEXT")
+        for table in ("hosts", "services", "service_observations"):
+            columns = {r["name"] for r in self.conn.execute(f"PRAGMA table_info({table})")}
+            if "provenance" not in columns:
+                self.conn.execute(
+                    f"ALTER TABLE {table} ADD COLUMN provenance TEXT "
+                    "NOT NULL DEFAULT '{\"kind\":\"legacy_unverified\"}'")
+            if table != "service_observations" and "observed_at" not in columns:
+                self.conn.execute(f"ALTER TABLE {table} ADD COLUMN observed_at TEXT")
         have_j = {r["name"] for r in self.conn.execute("PRAGMA table_info(scan_jobs)")}
         for name, ddl in (("resume_at", "INTEGER DEFAULT 0"), ("config", "TEXT")):
             if name not in have_j:
@@ -229,6 +266,29 @@ class Index:
 
     # -- writing -----------------------------------------------------------------
 
+    def _preserve_quarantine(self, ip: str) -> None:
+        """Archive unknown collisions before a sourced refresh can overwrite them.
+
+        Called inside the write transaction. Unknown, unselected services cannot
+        acquire trust merely because the host now has a sourced observation.
+        History stays in place with its original unverified attribution.
+        """
+        old_host = self.conn.execute("SELECT * FROM hosts WHERE ip=?", (ip,)).fetchone()
+        trusted = self.conn.execute("SELECT 1 FROM sourced_hosts WHERE ip=?", (ip,)).fetchone()
+        old_services = self.conn.execute(
+            "SELECT * FROM services WHERE ip=? AND id NOT IN "
+            "(SELECT id FROM sourced_services WHERE ip=?)", (ip, ip)).fetchall()
+        records = [("hosts", old_host)] if old_host is not None and not trusted else []
+        records.extend(("services", row) for row in old_services)
+        now = datetime.now(timezone.utc).isoformat()
+        self.conn.executemany(
+            "INSERT INTO quarantined_records(record_type,ip,payload,reason,quarantined_at) "
+            "VALUES(?,?,?,?,?)",
+            ((kind, ip, json.dumps(dict(row)), "unverified acquisition provenance", now)
+             for kind, row in records))
+        self.conn.executemany("DELETE FROM services WHERE id=?",
+                              ((row["id"],) for row in old_services))
+
     def upsert_host(self, host) -> None:
         """Refresh attempted services and retain an explicit observation trail.
 
@@ -236,9 +296,14 @@ class Index:
         ``scanned_ports=None`` preserves the legacy full-snapshot behavior.
         """
         if not host.services and not self.conn.execute(
-            "SELECT 1 FROM hosts WHERE ip=?", (host.ip,)
+            "SELECT 1 FROM sourced_hosts WHERE ip=?", (host.ip,)
         ).fetchone():
             return  # do not store billions of empty/unknown address documents
+        evidence = [asdict(service) for service in host.services]
+        provenance = scan_provenance({"ip": host.ip, "hostnames": host.hostnames,
+            "services": evidence, "scanned_ports": getattr(host, "scanned_ports", None)}, host.seen_at)
+        service_provenance = [scan_provenance(item, service.seen_at)
+                              for item, service in zip(evidence, host.services)]
         geo = enrich(host.ip)
         revision = self.catalog.revision()
         matches = [self._catalog_matches(s.product, s.version, revision=revision)
@@ -246,8 +311,9 @@ class Index:
         checked_at = datetime.now(timezone.utc).isoformat()
         with self._tx():
             previous = self.conn.execute(
-                "SELECT * FROM services WHERE ip=?", (host.ip,)
+                "SELECT * FROM sourced_services WHERE ip=?", (host.ip,)
             ).fetchall()
+            self._preserve_quarantine(host.ip)
             self.conn.execute(
                 """INSERT INTO hosts(ip, hostnames, country, city, org, asn,
                        lat, lon, seen_at)
@@ -259,6 +325,8 @@ class Index:
                 (host.ip, json.dumps(host.hostnames), geo.country, geo.city,
                  geo.org, geo.asn, geo.lat, geo.lon, host.seen_at),
             )
+            self.conn.execute("UPDATE hosts SET provenance=?, observed_at=?, tags='[]' WHERE ip=?",
+                              (json.dumps(provenance), host.seen_at, host.ip))
             # Only replace ports this observation actually attempted. A partial
             # web scan must not silently erase a previously observed SSH service.
             scanned_ports = getattr(host, "scanned_ports", None)
@@ -267,13 +335,15 @@ class Index:
             for old in previous:
                 selected = touched is None or (old["transport"] == "tcp" and old["port"] in touched)
                 if selected and (old["port"], old["transport"]) not in live:
+                    absent = scan_provenance({"ip": host.ip, "port": old["port"],
+                        "transport": old["transport"], "state": "not_observed"}, host.seen_at)
                     self.conn.execute(
                         """INSERT INTO service_observations
-                           (ip,port,transport,state,observed_at,details,note)
-                           VALUES(?,?,?,'not_observed',?,?,?)""",
+                           (ip,port,transport,state,observed_at,details,note,provenance)
+                           VALUES(?,?,?,'not_observed',?,?,?,?)""",
                         (host.ip, old["port"], old["transport"], host.seen_at,
                          json.dumps(dict(old)),
-                         "Not observed on rescan; not proof of closure or remediation."),
+                         "Not observed on rescan; not proof of closure or remediation.", json.dumps(absent)),
                     )
             if scanned_ports is None:  # legacy callers supply a full-host snapshot
                 self.conn.execute("DELETE FROM services WHERE ip=?", (host.ip,))
@@ -284,9 +354,9 @@ class Index:
                      if old["transport"] == "tcp" and old["port"] in touched),
                 )
             ip_int = ip_to_int(host.ip)
-            for s, catalog_matches in zip(host.services, matches):
+            for s, catalog_matches, attribution in zip(host.services, matches, service_provenance):
                 merged = _merge_advisories(s.vulns, catalog_matches)
-                vuln_ids = " ".join(v["cve"] for v in merged)
+                vuln_ids = " ".join(_advisory_ids(merged))
                 search = " ".join(filter(None, [
                     s.banner, s.product, s.version, s.service, s.os, s.ssl_cn,
                     s.ssl_issuer, geo.org, geo.country, geo.city, vuln_ids,
@@ -295,21 +365,22 @@ class Index:
                     """INSERT INTO services(ip, ip_int, port, transport, service,
                            product, version, os, has_ssl, ssl_cn, ssl_issuer, banner,
                            vulns, vuln_ids, search_text, seen_at, ssl_sans, ssl_trust,
-                           catalog_vulns, catalog_checked_at, catalog_revision, kev)
-                       VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                           catalog_vulns, catalog_checked_at, catalog_revision, kev,
+                           provenance, observed_at)
+                       VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                     (host.ip, ip_int, s.port, s.transport, s.service, s.product,
                      s.version, s.os, 1 if s.has_ssl else 0, s.ssl_cn, s.ssl_issuer,
                      s.banner, json.dumps(s.vulns), vuln_ids, search, s.seen_at,
                      json.dumps(s.ssl_sans), "unverified" if s.has_ssl else "not_observed",
                      json.dumps(catalog_matches), checked_at, revision,
-                     int(any(v.get("kev") for v in merged))),
+                     int(any(v.get("kev") for v in merged)), json.dumps(attribution), s.seen_at),
                 )
                 self.conn.execute(
                     """INSERT INTO service_observations
-                       (ip,port,transport,state,observed_at,details,note)
-                       VALUES(?,?,?,'open',?,?,?)""",
-                    (host.ip, s.port, s.transport, host.seen_at, json.dumps(asdict(s)),
-                     "Service answered; vulnerability status remains unverified."),
+                       (ip,port,transport,state,observed_at,details,note,provenance)
+                       VALUES(?,?,?,'open',?,?,?,?)""",
+                    (host.ip, s.port, s.transport, s.seen_at, json.dumps(asdict(s)),
+                     "Service answered; vulnerability status remains unverified.", json.dumps(attribution)),
                 )
 
     def service_history(self, ip: str, *, limit: int = 100, offset: int = 0) -> list[dict]:
@@ -317,31 +388,46 @@ class Index:
         if not 1 <= limit <= 1000 or offset < 0:
             raise ValueError("history limit must be 1..1000 and offset nonnegative")
         rows = self.conn.execute(
-            "SELECT * FROM service_observations WHERE ip=? ORDER BY id DESC LIMIT ? OFFSET ?",
+            "SELECT * FROM sourced_observations WHERE ip=? ORDER BY id DESC LIMIT ? OFFSET ?",
             (ip, limit, offset),
         ).fetchall()
-        return [dict(row, details=json.loads(row["details"])) for row in rows]
+        return [dict(row, details=json.loads(row["details"]),
+                     provenance=json.loads(row["provenance"])) for row in rows]
 
     def insert_raw(self, doc: dict) -> None:
-        """Insert a plain dict document (used by the demo seeder).
+        """Insert explicitly attributed provider inventory; reject missing provenance.
 
         Vulns are computed from (product, version) via :mod:`rennacs.vulns` unless the
         document already supplies a ``vulns`` list for a service.
         """
         from .vulns import check as vulncheck
+        from .provenance import validate_import
 
+        provenance = validate_import(doc.get("provenance"))
+        services = doc.get("services", [])
+        if not services:
+            return  # no provider observation; neither invent nor erase inventory
         geo = enrich(doc["ip"])
-        seen = doc.get("seen_at") or datetime.now(timezone.utc).isoformat()
+        seen = doc.get("observed_at", doc.get("seen_at"))
+        if seen is not None and not valid_timestamp(seen):
+            raise ValueError("observed_at must be a timezone-aware ISO8601 timestamp")
         lat = doc.get("lat", geo.lat)
         lon = doc.get("lon", geo.lon)
         tags = doc.get("tags", [])
         tag_text = " ".join(tags)
         revision = self.catalog.revision()
-        services = doc.get("services", [])
+        service_evidence = []
+        for service in services:
+            attribution = validate_import(service.get("provenance", provenance))
+            observed = service.get("observed_at", service.get("seen_at", seen))
+            if observed is not None and not valid_timestamp(observed):
+                raise ValueError("observed_at must be a timezone-aware ISO8601 timestamp")
+            service_evidence.append((attribution, observed))
         matches = [self._catalog_matches(s.get("product", ""), s.get("version", ""),
                                          revision=revision) for s in services]
         checked_at = datetime.now(timezone.utc).isoformat()
         with self._tx():
+            self._preserve_quarantine(doc["ip"])
             self.conn.execute(
                 """INSERT INTO hosts(ip, hostnames, country, city, org, asn,
                        lat, lon, tags, seen_at)
@@ -356,16 +442,18 @@ class Index:
                  doc.get("org") or geo.org, doc.get("asn") or geo.asn, lat, lon,
                  json.dumps(tags), seen),
             )
+            self.conn.execute("UPDATE hosts SET provenance=?, observed_at=? WHERE ip=?",
+                              (json.dumps(provenance), seen, doc["ip"]))
             self.conn.execute("DELETE FROM services WHERE ip=?", (doc["ip"],))
             ip_int = ip_to_int(doc["ip"])
-            for s, catalog_matches in zip(services, matches):
+            for s, catalog_matches, (attribution, observed) in zip(services, matches, service_evidence):
                 vulns = s.get("vulns")
                 if vulns is None:
                     vulns = [v.as_dict()
                              for v in vulncheck(s.get("product", ""),
                                                 s.get("version", ""))]
                 merged = _merge_advisories(vulns, catalog_matches)
-                vuln_ids = " ".join(v["cve"] for v in merged)
+                vuln_ids = " ".join(_advisory_ids(merged))
                 search = " ".join(filter(None, [
                     s.get("banner", ""), s.get("product", ""), s.get("version", ""),
                     s.get("service", ""), s.get("os", ""), s.get("ssl_cn", ""),
@@ -376,17 +464,18 @@ class Index:
                     """INSERT INTO services(ip, ip_int, port, transport, service,
                            product, version, os, has_ssl, ssl_cn, ssl_issuer, banner,
                            vulns, vuln_ids, search_text, seen_at, ssl_sans, ssl_trust,
-                           catalog_vulns, catalog_checked_at, catalog_revision, kev)
-                       VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                           catalog_vulns, catalog_checked_at, catalog_revision, kev,
+                           provenance, observed_at)
+                       VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                     (doc["ip"], ip_int, s["port"], s.get("transport", "tcp"),
                      s.get("service", ""), s.get("product", ""), s.get("version", ""),
-                     s.get("os", ""), 1 if s.get("has_ssl") else 0,
+                     s.get("os", ""), (None if s.get("has_ssl") is None else int(bool(s["has_ssl"]))),
                      s.get("ssl_cn", ""), s.get("ssl_issuer", ""),
-                     s.get("banner", ""), json.dumps(vulns), vuln_ids, search, seen,
+                     s.get("banner", ""), json.dumps(vulns), vuln_ids, search, observed,
                      json.dumps(s.get("ssl_sans", [])),
                      "unverified" if s.get("has_ssl") else "not_observed",
                      json.dumps(catalog_matches), checked_at, revision,
-                     int(any(v.get("kev") for v in merged))),
+                     int(any(v.get("kev") for v in merged)), json.dumps(attribution), observed),
                 )
 
     # -- offline advisory correlation --------------------------------------------
@@ -406,7 +495,7 @@ class Index:
         where, params = compile_query(query)
         revision = self.catalog.revision()
         rows = self.conn.execute(
-            f"""SELECT s.id,s.product,s.version FROM services s JOIN hosts h USING(ip)
+            f"""SELECT s.id,s.product,s.version FROM sourced_services s JOIN sourced_hosts h USING(ip)
                 WHERE s.id>? AND ({where}) ORDER BY s.id LIMIT ?""",
             [after_id, *params, limit + 1],
         ).fetchall()
@@ -432,15 +521,15 @@ class Index:
         ):
             raise ValueError("catalog matches must be advisory dictionaries")
         row = self.conn.execute(
-            """SELECT s.*, h.org, h.country, h.city, h.tags FROM services s
-               JOIN hosts h USING(ip) WHERE s.id=?""", (service_id,)
+            """SELECT s.*, h.org, h.country, h.city, h.tags FROM sourced_services s
+               JOIN sourced_hosts h USING(ip) WHERE s.id=?""", (service_id,)
         ).fetchone()
         if row is None:
             raise ValueError("no such service")
         data = dict(row)
         legacy = json.loads(data.get("vulns") or "[]")
         merged = _merge_advisories(legacy, matches)
-        ids = " ".join(item["cve"] for item in merged)
+        ids = " ".join(_advisory_ids(merged))
         tags = " ".join(json.loads(data.get("tags") or "[]"))
         search = " ".join(str(data.get(key) or "") for key in (
             "banner", "product", "version", "service", "os", "ssl_cn",
@@ -500,14 +589,15 @@ class Index:
     # -- reading -----------------------------------------------------------------
 
     def host(self, ip: str) -> dict | None:
-        row = self.conn.execute("SELECT * FROM hosts WHERE ip=?", (ip,)).fetchone()
+        row = self.conn.execute("SELECT * FROM sourced_hosts WHERE ip=?", (ip,)).fetchone()
         if not row:
             return None
         services = self.conn.execute(
-            "SELECT * FROM services WHERE ip=? ORDER BY port", (ip,)
+            "SELECT * FROM sourced_services WHERE ip=? ORDER BY port", (ip,)
         ).fetchall()
         doc = dict(row)
         doc["hostnames"] = json.loads(doc.get("hostnames") or "[]")
+        doc["provenance"] = json.loads(doc["provenance"])
         doc["tags"] = json.loads(doc.get("tags") or "[]")
         svc = []
         for s in services:
@@ -516,15 +606,29 @@ class Index:
         doc["vuln_count"] = sum(len(s["vulns"]) for s in svc)
         return doc
 
+    def data_status(self) -> dict:
+        """Acquisition coverage, separate from advisory/correlation confidence."""
+        result = {"policy": "real_only"}
+        for table in ("hosts", "services"):
+            sourced = self.conn.execute(f"SELECT COUNT(*) FROM sourced_{table}").fetchone()[0]
+            total = self.conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+            archived = self.conn.execute("SELECT COUNT(*) FROM quarantined_records WHERE record_type=?",
+                                         (table,)).fetchone()[0]
+            result[f"sourced_{table}"] = sourced
+            result[f"quarantined_{table}"] = total - sourced + archived
+        return result
+
     # -- cve.now enrichment ------------------------------------------------------
 
     def distinct_cves(self) -> list[str]:
         """Every CVE id currently referenced by the index (for a refresh pass)."""
-        ids: set[str] = set()
-        for (vids,) in self.conn.execute(
-                "SELECT vuln_ids FROM services WHERE vuln_ids<>''").fetchall():
-            ids.update(vids.split())
-        return sorted(ids)
+        return sorted({token for ids in self._referenced_advisory_ids() for token in ids})
+
+    def _referenced_advisory_ids(self):
+        """Read exact JSON tokens, not whitespace-split copies of source identifiers."""
+        for row in self.conn.execute("SELECT vulns, catalog_vulns FROM sourced_services"):
+            merged = _merge_advisories(json.loads(row[0] or "[]"), json.loads(row[1] or "[]"))
+            yield _advisory_ids(merged)
 
     def reenrich(self, cvenow, *, allow_network: bool = False) -> dict:
         """Re-merge every stored vuln with cve.now data (from cache by default).
@@ -542,7 +646,7 @@ class Index:
                 cvenow.entry(cve, allow_network=True)   # warm cache, no lock held
         counts = {"services": 0, "enriched": 0, "kev": 0}
         rows = self.conn.execute(
-            "SELECT id, version, vulns, catalog_vulns FROM services WHERE vuln_ids<>''").fetchall()
+            "SELECT id, version, vulns, catalog_vulns FROM sourced_services WHERE vuln_ids<>''").fetchall()
         with self._tx():
             for row in rows:
                 try:
@@ -553,6 +657,7 @@ class Index:
                     continue
                 merged = [cvenow.enrich_vuln(v, row["version"] or "",
                                              allow_network=False)  # cache-only in tx
+                          if valid_id(v.get("cve")) else v
                           for v in vulns]
                 catalog = json.loads(row["catalog_vulns"] or "[]")
                 kev = int(any(v.get("kev") for v in _merge_advisories(merged, catalog)))
@@ -568,27 +673,27 @@ class Index:
         from collections import Counter
         c = self.conn.execute
         vc: Counter = Counter()
-        for (ids,) in c("SELECT vuln_ids FROM services WHERE vuln_ids<>''").fetchall():
-            vc.update(ids.split())
+        for ids in self._referenced_advisory_ids():
+            vc.update(ids)
         return {
-            "hosts": c("SELECT COUNT(*) FROM hosts").fetchone()[0],
-            "services": c("SELECT COUNT(*) FROM services").fetchone()[0],
+            "hosts": c("SELECT COUNT(*) FROM sourced_hosts").fetchone()[0],
+            "services": c("SELECT COUNT(*) FROM sourced_services").fetchone()[0],
             "top_ports": [dict(r) for r in c(
-                "SELECT port, COUNT(*) n FROM services GROUP BY port "
+                "SELECT port, COUNT(*) n FROM sourced_services GROUP BY port "
                 "ORDER BY n DESC LIMIT 10").fetchall()],
             "top_products": [dict(r) for r in c(
-                "SELECT product, COUNT(*) n FROM services "
+                "SELECT product, COUNT(*) n FROM sourced_services "
                 "WHERE product<>'' GROUP BY product ORDER BY n DESC LIMIT 10"
             ).fetchall()],
             "top_countries": [dict(r) for r in c(
-                "SELECT country, COUNT(DISTINCT ip) n FROM services "
-                "JOIN hosts USING(ip) WHERE country<>'' GROUP BY country "
+                "SELECT country, COUNT(DISTINCT ip) n FROM sourced_services "
+                "JOIN sourced_hosts USING(ip) WHERE country<>'' GROUP BY country "
                 "ORDER BY n DESC LIMIT 10").fetchall()],
             "top_vulns": [{"cve": cve, "n": n} for cve, n in vc.most_common(10)],
             "vuln_services": c(
-                "SELECT COUNT(*) FROM services WHERE vuln_ids<>''").fetchone()[0],
+                "SELECT COUNT(*) FROM sourced_services WHERE vuln_ids<>''").fetchone()[0],
             "kev_services": c(
-                "SELECT COUNT(*) FROM services WHERE kev=1").fetchone()[0],
+                "SELECT COUNT(*) FROM sourced_services WHERE kev=1").fetchone()[0],
         }
 
     def map_points(self, where_sql: str = "1", params: list | None = None) -> dict:
@@ -606,7 +711,7 @@ class Index:
             f"""SELECT h.ip, h.lat, h.lon, h.city, h.country, h.org,
                        COUNT(s.id) ports,
                        SUM(CASE WHEN s.vuln_ids<>'' THEN 1 ELSE 0 END) vulns
-                FROM hosts h JOIN services s ON s.ip = h.ip
+                FROM sourced_hosts h JOIN sourced_services s ON s.ip = h.ip
                 WHERE h.lat IS NOT NULL AND h.lon IS NOT NULL AND ({where_sql})
                 GROUP BY h.ip""", params
         ).fetchall():
@@ -614,13 +719,13 @@ class Index:
             d["vulns"] = int(d["vulns"] or 0)
             located.append(d)
         ungeo = [row[0] for row in self.conn.execute(
-            f"""SELECT DISTINCT h.ip FROM hosts h JOIN services s ON s.ip = h.ip
+            f"""SELECT DISTINCT h.ip FROM sourced_hosts h JOIN sourced_services s ON s.ip = h.ip
                 WHERE (h.lat IS NULL OR h.lon IS NULL) AND ({where_sql})
                 ORDER BY h.ip""", params
         ).fetchall()]
         countries = [dict(r) for r in self.conn.execute(
             f"""SELECT h.country, COUNT(DISTINCT h.ip) n
-                FROM hosts h JOIN services s ON s.ip = h.ip
+                FROM sourced_hosts h JOIN sourced_services s ON s.ip = h.ip
                 WHERE h.lat IS NOT NULL AND h.country<>'' AND ({where_sql})
                 GROUP BY h.country ORDER BY n DESC LIMIT 12""", params
         ).fetchall()]
@@ -631,7 +736,7 @@ class Index:
     def hosts_without_geo(self) -> list[str]:
         """IPs in the index that have no coordinates yet (candidates for geolocation)."""
         return [r[0] for r in self.conn.execute(
-            "SELECT ip FROM hosts WHERE lat IS NULL OR lon IS NULL "
+            "SELECT ip FROM sourced_hosts WHERE lat IS NULL OR lon IS NULL "
             "ORDER BY ip").fetchall()]
 
     def update_host_geo(self, ip: str, geo) -> None:
@@ -639,7 +744,8 @@ class Index:
         self.conn.execute(
             """UPDATE hosts SET lat=?, lon=?, country=COALESCE(NULLIF(?,''),country),
                    city=COALESCE(NULLIF(?,''),city), org=COALESCE(NULLIF(?,''),org),
-                   asn=COALESCE(NULLIF(?,''),asn) WHERE ip=?""",
+                   asn=COALESCE(NULLIF(?,''),asn) WHERE ip=?
+                   AND ip IN (SELECT ip FROM sourced_hosts)""",
             (geo.lat, geo.lon, geo.country, geo.city, geo.org, geo.asn, ip))
         self.conn.commit()
 
@@ -650,7 +756,7 @@ class Index:
         Each result row is a service joined to its host — the same granularity Shodan
         shows in a results list (one banner per row).
         """
-        base = ("FROM services s JOIN hosts h ON h.ip = s.ip "
+        base = ("FROM sourced_services s JOIN sourced_hosts h ON h.ip = s.ip "
                 f"WHERE {where_sql}")
         total = self.conn.execute(
             f"SELECT COUNT(*) {base}", params).fetchone()[0]

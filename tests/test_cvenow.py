@@ -1,4 +1,5 @@
 """Tests for the cve.now client — with a fake fetcher so no network is touched."""
+from tests.inventory_fixture import with_test_source
 
 import urllib.error
 
@@ -286,10 +287,10 @@ def test_redirect_guard_blocks_private_and_foreign_hosts():
 def test_reenrich_with_network_uses_two_phase(tmp_path):
     """LOW finding: reenrich(allow_network=True) must not deadlock on its own DB."""
     idx = Index(str(tmp_path / "r.db"))
-    idx.insert_raw({"ip": "10.0.0.1", "services": [
+    idx.insert_raw(with_test_source({"ip": "10.0.0.1", "services": [
         {"port": 80, "service": "http", "product": "Apache httpd", "version": "2.4.49"},
         {"port": 22, "service": "ssh", "product": "OpenSSH", "version": "9.2p1"},
-    ]})
+    ]}))
     c = CVENow(str(tmp_path / "r.db"), now_iso="2026-10-27T00:00:00Z")
     c._get_json = FakeNet()
     counts = idx.reenrich(c, allow_network=True)   # must complete, not lock up
@@ -300,9 +301,9 @@ def test_reenrich_with_network_uses_two_phase(tmp_path):
 
 def test_reenrich_updates_services_and_kev(tmp_path):
     idx = Index(str(tmp_path / "s.db"))
-    idx.insert_raw({"ip": "10.0.0.9", "services": [
+    idx.insert_raw(with_test_source({"ip": "10.0.0.9", "services": [
         {"port": 80, "service": "http", "product": "Apache httpd", "version": "2.4.49"},
-    ]})
+    ]}))
     c = CVENow(str(tmp_path / "s.db"), now_iso="2026-10-27T00:00:00Z")
     c._get_json = FakeNet()
     # populate cache first (network), then merge from cache

@@ -415,11 +415,9 @@ def cmd_enrich(args) -> int:
 
 def cmd_import(args) -> int:
     """Import REAL host data from Shodan InternetDB (free, no key, no scanning)."""
-    from rennacs.internetdb import InternetDB, STARTER
+    from rennacs.internetdb import InternetDB
 
     targets: list[str] = []
-    if args.starter:
-        targets = list(STARTER)
     for t in args.targets:
         if t.startswith("@"):
             try:
@@ -438,7 +436,7 @@ def cmd_import(args) -> int:
             seen.add(ip)
             ips.append(ip)
     if not ips:
-        print("nothing to import. Give IPs/CIDRs, @file, or --starter.", file=sys.stderr)
+        print("nothing to import. Supply explicit IPs/CIDRs or @file.", file=sys.stderr)
         return 1
     if len(ips) > args.max:
         print(f"[!] {len(ips)} targets > --max {args.max}; importing the first "
@@ -664,8 +662,7 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("import", help="import REAL host data from Shodan InternetDB")
     p.add_argument("targets", nargs="*", default=[],
                    help="IPs / CIDRs / @file of IPs to look up")
-    p.add_argument("--starter", action="store_true",
-                   help="import a curated set of real public hosts (great for the map)")
+
     p.add_argument("--rate", type=float, default=1.0,
                    help="lookups per second (InternetDB free tier is ~1/s)")
     p.add_argument("--max", type=int, default=512, help="cap number of targets")

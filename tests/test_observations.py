@@ -1,4 +1,5 @@
 """Current observations must not erase services outside a scan's scope."""
+from tests.inventory_fixture import with_test_source
 from types import SimpleNamespace
 
 from rennacs.scanner import ServiceResult
@@ -12,9 +13,9 @@ def observation(ip, ports, services=()):
 
 
 def test_partial_port_rescan_preserves_unscanned_services(empty_index):
-    empty_index.insert_raw({"ip": "127.0.0.1", "services": [
+    empty_index.insert_raw(with_test_source({"ip": "127.0.0.1", "services": [
         {"port": 22, "service": "ssh"}, {"port": 80, "service": "http"},
-    ]})
+    ]}))
     empty_index.upsert_host(observation("127.0.0.1", [80], [ServiceResult(port=80)]))
     assert [s["port"] for s in empty_index.host("127.0.0.1")["services"]] == [22, 80]
 

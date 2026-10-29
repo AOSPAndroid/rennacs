@@ -1,4 +1,4 @@
-"""Rennacs — an educational, self-hosted device search engine.
+"""Rennacs — a local index of network observations and advisory correlations.
 
 See the top-level README for scope, authorization rules, and architecture.
 """

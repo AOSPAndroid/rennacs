@@ -5,9 +5,9 @@
 <section class="hero">
   <h1>Search engine for devices on networks you control</h1>
   <p class="sub">
-    A self-hosted, educational re-creation of Shodan. Sweep whole networks you're
-    authorized for, index the banners continuously, and search them with a filter
-    query language.
+    Search recorded service observations from authorized scans and sourced imports.
+    Review banners, observation history and potential advisory correlations in a
+    local index. Counts reflect indexed records, not estimated Internet coverage.
   </p>
 </section>
 
@@ -26,16 +26,33 @@
   </div>
   {% if stats.kev_services %}
   <div class="stat stat-kev">
-    <div class="num">{{ stats.kev_services }}</div><div class="lbl">known exploited</div>
+    <div class="num">{{ stats.kev_services }}</div>
+    <div class="lbl" title="Linked vulnerabilities are known exploited elsewhere; not proof of exploitation of these hosts.">services with KEV-linked advisories</div>
   </div>
   {% endif %}
 </section>
 
 {% if stats.hosts == 0 %}
 <div class="empty-note">
-  The index is empty. Load the demo dataset with <code>python demo_seed.py</code>,
-  or scan your own machine with <code>python cli.py scan 127.0.0.1</code>.
+  The index is empty. Collect observations with an authorized scan, such as
+  <code>python cli.py scan 127.0.0.1</code> on your own machine, or import records
+  from a source you are permitted to use with <code>python cli.py import @ips.txt</code>.
+  No host or service records are generated automatically.
 </div>
+{% endif %}
+
+{% if data_status %}
+<section class="panel" aria-label="Data quality">
+  <h3>Data quality</h3>
+  <p>Sourced hosts: <strong>{{ data_status.sourced_hosts }}</strong> ·
+     sourced services: <strong>{{ data_status.sourced_services }}</strong></p>
+  <p>Quarantined hosts: <strong>{{ data_status.quarantined_hosts }}</strong> ·
+     quarantined services: <strong>{{ data_status.quarantined_services }}</strong></p>
+  <p>Records without supported acquisition provenance are excluded from search, maps and findings.
+     Reacquire observations through an authorized scan or a validated source import;
+     changing a label does not establish their origin.</p>
+  <a href="{{ url_for('api_data_status') }}">View source and quarantine counts (JSON)</a>
+</section>
 {% endif %}
 
 <section class="panels">
@@ -81,7 +98,7 @@
       <tr><td><a href="{{ url_for('search', q='country:' ~ c.country) }}">{{ c.country }}</a></td>
           <td class="n">{{ c.n }}</td></tr>
       {% else %}
-      <tr><td class="muted">private / lab hosts only</td></tr>
+      <tr><td class="muted">no sourced geolocation yet</td></tr>
       {% endfor %}
     </table>
   </div>

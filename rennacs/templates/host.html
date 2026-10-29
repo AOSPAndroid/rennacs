@@ -30,7 +30,11 @@
       {% if doc.org %}<tr><th>Organization</th><td>{{ doc.org }}</td></tr>{% endif %}
       {% if doc.asn %}<tr><th>ASN</th><td>{{ doc.asn }}</td></tr>{% endif %}
       <tr><th>Open ports</th><td>{{ doc.services|length }}</td></tr>
-      <tr><th>Last seen</th><td>{{ doc.seen_at[:19]|replace('T', ' ') }}</td></tr>
+      <tr><th>Observed at</th><td>{{ doc.seen_at or 'not supplied by source' }}</td></tr>
+      {% if doc.provenance %}
+      <tr><th>Data source</th><td>{{ doc.provenance.source }} ({{ doc.provenance.kind }})</td></tr>
+      <tr><th>Source retrieved at</th><td>{{ doc.provenance.retrieved_at }}</td></tr>
+      {% endif %}
     </table>
   </div>
 
@@ -54,8 +58,11 @@
       {% if s.has_ssl %}<span class="tag ssl">SSL</span>{% endif %}
       {% if s.os %}<span class="tag os">{{ s.os }}</span>{% endif %}
       {% for v in s.vulns %}<span class="tag vuln sev-{{ v.severity }}">{{ v.cve }}</span>{% endfor %}
-      <span class="svc-seen">{{ s.seen_at[:19]|replace('T', ' ') }}</span>
+      <span class="svc-seen">Observed: {{ s.seen_at or 'not supplied by source' }}</span>
     </header>
+    {% if s.provenance %}<p class="muted">Data source: {{ s.provenance.source }} ·
+      retrieved: {{ s.provenance.retrieved_at }}.
+      Collection/import time is not necessarily the provider's observation time.</p>{% endif %}
     {% if s.vulns %}
     <div class="vuln-box">
       <strong>⚠ Possible vulnerabilities</strong>
