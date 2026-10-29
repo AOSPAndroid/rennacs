@@ -277,6 +277,35 @@ def cmd_hunt(args) -> int:
     return 0
 
 
+def cmd_scope(args) -> int:
+    """Resolve a country/region scope from RIPE delegated statistics."""
+    from pathlib import Path as _P
+
+    from rennacs import regions
+
+    try:
+        countries = regions.resolve(args.region, args.country)
+    except ValueError as exc:
+        print(f"scope error: {exc}", file=sys.stderr)
+        return 2
+    path = regions.fetch(_P(args.cache))
+    scope = regions.parse(path, countries)
+    info = scope.summary()
+    if args.json:
+        print(json.dumps({"countries": scope.countries, **info,
+                          "ipv4": [str(n) for n in scope.ipv4][:args.limit],
+                          "ipv6": [str(n) for n in scope.ipv6][:args.limit]}, indent=2))
+    else:
+        print(f"{info['countries']} countries, {info['ipv4_blocks']} IPv4 block(s), "
+              f"{info['ipv4_addresses']:,} addresses, {info['ipv6_prefixes']} IPv6 prefix(es)")
+        print(f"~{info['estimated_days_at_500cps']} day(s) at 500 conn/s")
+        print("countries: " + " ".join(scope.countries))
+    if args.out:
+        _P(args.out).write_text("\n".join(str(n) for n in scope.ipv4) + "\n", encoding="utf-8")
+        print(f"wrote {len(scope.ipv4)} IPv4 block(s) to {args.out}")
+    return 0
+
+
 def cmd_sweep(args) -> int:
     """Network-wide sweep: the Shodan-style crawler, bounded to authorized scope."""
     from rennacs import sweep as sweepmod
@@ -811,6 +840,16 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--enrich-limit", type=int, default=60,
                    help="max advisory lookups after a hunt")
     p.set_defaults(func=cmd_hunt)
+
+    p = sub.add_parser("scope", help="country/region scope from RIPE delegated stats")
+    p.add_argument("--region", nargs="+", default=["western", "eastern"],
+                   choices=["western", "eastern"])
+    p.add_argument("--country", nargs="*", help="narrow to country codes, e.g. FR DE")
+    p.add_argument("--out", help="write the IPv4 blocks to a file")
+    p.add_argument("--limit", type=int, default=50, help="blocks shown with --json")
+    p.add_argument("--cache", default="ripe-delegated.txt")
+    p.add_argument("--json", action="store_true")
+    p.set_defaults(func=cmd_scope)
 
     p = sub.add_parser("sweep", help="network-wide sweep (Shodan-style crawler)")
     p.add_argument("scope", nargs="?", default="",

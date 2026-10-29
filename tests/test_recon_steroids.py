@@ -194,3 +194,71 @@ def test_rank_prefers_confirmed_kernel_at_equal_severity():
     inferred = {"ip": "b", "port": 1, "service": {"kernel_confidence": "inferred"},
                 "advisories": [{"cvss": 9.8}]}
     assert sorted([inferred, confirmed], key=rank_key)[0] is confirmed
+
+
+# -- region scopes -------------------------------------------------------------
+
+_SAMPLE = """ripencc|*|ipv4|*|100|summary
+ripencc|FR|ipv4|192.0.2.0|256|20200101|allocated
+ripencc|FR|ipv4|198.51.100.0|512|20200101|assigned
+ripencc|DE|ipv4|203.0.113.0|1024|20200101|allocated
+ripencc|US|ipv4|8.8.8.0|256|20200101|allocated
+ripencc|FR|ipv6|2001:db8::|4294967296|20200101|allocated
+"""
+
+
+def _scope_file(tmp_path):
+    path = tmp_path / "delegated.txt"
+    path.write_text(_SAMPLE, encoding="utf-8")
+    return path
+
+
+def test_parse_keeps_only_requested_countries(tmp_path):
+    from rennacs import regions
+    scope = regions.parse(_scope_file(tmp_path), {"FR"})
+    assert scope.countries == ["FR"]
+    assert scope.ipv4_addresses == 768
+    assert all(n.is_private or True for n in scope.ipv4)
+
+
+def test_parse_summarises_contiguous_blocks(tmp_path):
+    from rennacs import regions
+    scope = regions.parse(_scope_file(tmp_path), {"FR"})
+    # 192.0.2.0/24 + 198.51.100.0/23 stay separate; no over-merging.
+    assert len(scope.ipv4) == 2
+
+
+def test_parse_collects_ipv6_prefixes(tmp_path):
+    from rennacs import regions
+    scope = regions.parse(_scope_file(tmp_path), {"FR"})
+    assert len(scope.ipv6) == 1
+
+
+def test_resolve_unions_regions():
+    from rennacs import regions
+    both = regions.resolve(["western", "eastern"])
+    assert "FR" in both and "PL" in both and "US" not in both
+
+
+def test_resolve_narrows_to_countries():
+    from rennacs import regions
+    assert regions.resolve(["western"], ["fr", "de"]) == {"FR", "DE"}
+
+
+def test_resolve_rejects_country_outside_region():
+    from rennacs import regions
+    with pytest.raises(ValueError, match="outside"):
+        regions.resolve(["western"], ["PL"])
+
+
+def test_resolve_rejects_unknown_region():
+    from rennacs import regions
+    with pytest.raises(ValueError, match="unknown region"):
+        regions.resolve(["mars"])
+
+
+def test_summary_reports_scan_estimate(tmp_path):
+    from rennacs import regions
+    info = regions.parse(_scope_file(tmp_path), {"DE"}).summary()
+    assert info["ipv4_addresses"] == 1024
+    assert info["estimated_days_at_500cps"] == 0.0
