@@ -1,4 +1,5 @@
 """Catalog-report fixtures are synthetic and never contact advisory/host APIs."""
+from tests.inventory_fixture import with_test_source
 from rennacs.findings import assess_service
 import pytest
 
@@ -50,9 +51,9 @@ def test_report_rejects_malformed_ids_instead_of_normalizing(advisory_id):
 
 def test_local_report_exposes_catalog_coverage_and_reassessment_time(empty_index):
     from rennacs.findings import report
-    empty_index.insert_raw({"ip": "127.0.0.1", "seen_at": "2026-10-28T00:00:00Z",
+    empty_index.insert_raw(with_test_source({"ip": "127.0.0.1", "seen_at": "2026-10-28T00:00:00Z",
         "services": [{"port": 80, "product": "Fixture Server", "version": "1.5",
-                      "vulns": []}]})
+                      "vulns": []}]}))
     empty_index.catalog.upsert({"id": "CVE-2099-19999", "affected": [
         {"product": "Fixture Server", "ranges": [{"introduced": "1.0", "fixed": "2.0"}]}]})
     empty_index.reassess_catalog()

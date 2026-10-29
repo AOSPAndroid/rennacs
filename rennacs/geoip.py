@@ -1,11 +1,10 @@
 """Geo/org enrichment — the Rennacs equivalent of Shodan's GeoIP + WHOIS annotations.
 
-Two layers, so the "global map" works out of the box yet stays offline-first:
+Two source-backed layers, with unknown public locations left unknown:
 
 * :func:`enrich` is the **offline** layer used at index time (never hits the network):
-  loopback/private ranges get a lab label, a few well-known public IPs are hand-mapped,
-  and an optional MaxMind GeoLite2 database is used when present. Fast, no I/O stalls
-  during a sweep.
+  loopback/private ranges get classification labels, and an optional MaxMind GeoLite2
+  database is used when present. No public coordinates or organisations are canned.
 * :class:`GeoLocator` is the **network** layer, invoked by an explicit ``cli.py geo``
   step (like ``cli.py enrich`` for CVEs). It looks up real coordinates for public hosts
   via a free, keyless API (ipwho.is by default), caches them locally, and fills in each
@@ -19,6 +18,7 @@ from __future__ import annotations
 import ipaddress
 import json
 import os
+import re
 import sqlite3
 import time
 from dataclasses import dataclass
@@ -35,14 +35,6 @@ class Geo:
     lat: float | None = None   # for the map view; None == not geolocated
     lon: float | None = None
 
-
-# A handful of well-known public IPs, so the demo data has recognisable org/geo values
-# even before the network geolocation step runs.
-_KNOWN = {
-    "8.8.8.8": Geo("US", "Mountain View", "Google LLC", "AS15169", 37.386, -122.084),
-    "1.1.1.1": Geo("US", "Los Angeles", "Cloudflare, Inc.", "AS13335", 34.053, -118.243),
-    "9.9.9.9": Geo("US", "Berkeley", "Quad9", "AS19281", 37.871, -122.273),
-}
 
 # Optional offline MaxMind GeoLite2-City database (best accuracy, no network). Set the
 # path via RENNACS_GEOLITE2 or drop GeoLite2-City.mmdb next to the project.
@@ -83,8 +75,6 @@ def enrich(ip: str) -> Geo:
     except ValueError:
         return Geo()
 
-    if ip in _KNOWN:
-        return _KNOWN[ip]
     if addr.is_loopback:
         return Geo(country="", city="localhost", org="Local host", asn="")
     if addr.is_private:
@@ -153,7 +143,8 @@ class GeoLocator:
         if not row["success"]:
             return {"__absent__": True}
         try:
-            return json.loads(row["json"])
+            cached = json.loads(row["json"])
+            return cached if _geo_from_dict(cached) is not None else None
         except (TypeError, ValueError):
             return None
 
@@ -171,11 +162,14 @@ class GeoLocator:
                                          timeout=self.timeout)
         except FETCH_ERRORS:
             return None
-        if not isinstance(raw, dict) or not raw.get("success"):
+        if (not isinstance(raw, dict) or raw.get("success") is not True
+                or ("ip" in raw and raw["ip"] != ip)):
             # ipwho.is returns {success:false} for private/invalid — cache the absence
             self._store_absent(ip)
             return None
         geo = _normalize_ipwhois(raw)
+        if geo is None:
+            return None
         self._store(ip, geo)
         return geo
 
@@ -226,11 +220,40 @@ class GeoLocator:
         return counts
 
 
-def _normalize_ipwhois(raw: dict) -> Geo:
-    conn = raw.get("connection") or {}
+def _coordinates_valid(lat, lon) -> bool:
+    return (type(lat) in (int, float) and type(lon) in (int, float)
+            and -90 <= lat <= 90 and -180 <= lon <= 180)
+
+
+def _text_fields_valid(*values) -> bool:
+    for value in values:
+        if value is None:
+            continue
+        if not isinstance(value, str):
+            return False
+        try:
+            value.encode("utf-8", errors="strict")
+        except UnicodeEncodeError:
+            return False
+    return True
+
+
+def _normalize_ipwhois(raw: dict) -> Geo | None:
+    if not _coordinates_valid(raw.get("latitude"), raw.get("longitude")):
+        return None
+    conn = raw.get("connection", {})
+    if conn is None:
+        conn = {}
+    if not isinstance(conn, dict):
+        return None
+    if not _text_fields_valid(raw.get("country_code"), raw.get("country"),
+                              raw.get("city"), conn.get("org"), conn.get("isp")):
+        return None
     asn = conn.get("asn")
+    if asn is not None and (type(asn) is not int or not 1 <= asn <= 4294967295):
+        return None
     return Geo(
-        country=raw.get("country_code") or raw.get("country", ""),
+        country=raw.get("country_code") or raw.get("country") or "",
         city=raw.get("city", "") or "",
         org=conn.get("org") or conn.get("isp", "") or "",
         asn=(f"AS{asn}" if asn else ""),
@@ -244,7 +267,15 @@ def _geo_to_dict(g: Geo) -> dict:
             "lat": g.lat, "lon": g.lon}
 
 
-def _geo_from_dict(d: dict) -> Geo:
-    return Geo(country=d.get("country", ""), city=d.get("city", ""),
-              org=d.get("org", ""), asn=d.get("asn", ""),
+def _geo_from_dict(d: dict) -> Geo | None:
+    if not isinstance(d, dict) or not _coordinates_valid(d.get("lat"), d.get("lon")):
+        return None
+    if not _text_fields_valid(*(d.get(key) for key in ("country", "city", "org", "asn"))):
+        return None
+    asn = d.get("asn") or ""
+    if asn and (not re.fullmatch(r"AS[1-9][0-9]{0,9}", asn)
+                or int(asn[2:]) > 4294967295):
+        return None
+    return Geo(country=d.get("country") or "", city=d.get("city") or "",
+              org=d.get("org") or "", asn=asn,
               lat=d.get("lat"), lon=d.get("lon"))

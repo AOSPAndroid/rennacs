@@ -42,7 +42,7 @@ from urllib.parse import urlparse
 from .vulns import _cmp, _parse_version
 
 BASE = "https://cve.now"
-USER_AGENT = "Rennacs/0.2 (+educational; https://cve.now integration)"
+USER_AGENT = "Rennacs/0.2 (https://cve.now integration)"
 MAX_RESPONSE_BYTES = 4 * 1024 * 1024   # 4 MiB: ample for one entry or a 30-item list
 
 # The id is interpolated into the FIRST request URL, so accept CVE/GHSA/OSV ids only

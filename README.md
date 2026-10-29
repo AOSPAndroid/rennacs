@@ -1,321 +1,242 @@
-# Rennacs — an educational "Shodan-style" device search engine
+# Rennacs — network observations and exposure search
 
-Rennacs is a small, self-contained project that recreates the core ideas behind
-[Shodan](https://www.shodan.io/) for **learning purposes**. It scans hosts you are
-authorized to scan, grabs service banners, fingerprints what's running, indexes the
-results in a local database, and gives you a Shodan-like web UI with a filter query
-language and per-host detail pages.
+Rennacs collects TCP service observations from assets you are authorized to assess,
+imports source-attributed inventory, and stores the results in a local SQLite index.
+The CLI, Flask UI and JSON API expose recorded services, banners, TLS metadata,
+observation history and **potential** advisory correlations.
 
-## Multi-service foundation build
+**A new index starts empty.** Rennacs does not generate fabricated host records,
+service banners, locations or inventory statistics. A scan may find no responding
+services, and an import may return no data. Neither outcome is filled with invented
+records. Synthetic inventory exists only in isolated automated tests, never loaded
+by the application.
 
-The current development branch adds multi-service TCP profiles, an offline IPv4
-coverage planner, reliable resume/refresh behavior, TLS metadata and evidence-backed
-potential-finding reports. See [the build guide](docs/BUILD.md) for working commands,
-verification and explicit production/UDP limitations. It does not start a global scan
-or install a weekly schedule.
+This is a working local TCP acquisition/search foundation, **not** a production SaaS
+or a verified Internet-scale crawler. See [the build guide](docs/BUILD.md) for current
+capabilities and remaining work, and [the catalog guide](docs/CATALOG.md) for advisory
+acquisition, coverage and matching limits.
 
-It was built to understand *how* a device search engine works end-to-end:
+## Scope and authorization
 
-```
-  target ──► scanner ──► fingerprinter ──► indexer (SQLite) ──► search API ──► web UI
-            (TCP connect   (banner → product   (one document      (filter query    (results +
-             + banner)      / version guess)    per host)          language)        host pages)
-```
+Only scan assets you own or have explicit permission to assess. Applicable law,
+network-owner consent and ISP/provider policy still apply.
 
-## ⚠️ Scope & authorization
+- The default scan policy permits loopback and RFC1918 private addresses. Address
+  class is a technical boundary, **not evidence of permission**: private networks can
+  belong to other people.
+- Public scan targets require `--i-am-authorized`. That flag is an operator assertion;
+  it does not grant permission, verify ownership or establish engagement scope.
+- Hostnames resolve to checked destination addresses; probes connect to those same
+  addresses. The original hostname supplies HTTP Host/TLS SNI.
+- InternetDB imports are provider database lookups, not active scans of the targets.
+  Check provider terms, permitted use, attribution and commercial redistribution
+  rights before importing or publishing data.
+- Intrusive validation, exploitation and system-changing remediation are not part of
+  discovery. They require separate owner-approved scope and safeguards.
 
-Shodan continuously scans the entire public Internet. **Rennacs deliberately does
-not.** Mass-scanning hosts you don't own is, depending on jurisdiction, abusive or
-illegal, so Rennacs refuses to scan anything outside an allow-list by default:
+No installation command, page view or offline planner starts a public scan or installs
+a recurring schedule. Do not expose the development Flask server or your personal PC
+directly to customers.
 
-- `localhost` / `127.0.0.1` and your own machine are always allowed.
-- **Private / lab ranges** (RFC1918: `10.0.0.0/8`, `172.16.0.0/12`,
-  `192.168.0.0/16`) are allowed.
-- Any **public** address requires you to pass `--i-am-authorized`, which prints a
-  reminder that you must have explicit permission for that target (e.g. your own
-  VPS, or a sanctioned lab such as `scanme.nmap.org`).
+## Install and open an empty index
 
-This keeps the project useful for a classroom lab (scan the VMs on your own subnet)
-while making the "don't point this at the Internet" lesson a first-class feature.
-
-## Quick start
-
-```bash
-pip install -r requirements.txt
-
-# 0. REAL DATA, no scanning: import real hosts from Shodan's free InternetDB,
-#    geolocate them, and pull real CVE severities — then browse a real global map
-python cli.py import --starter    # real ports/CVEs/tags for well-known public hosts
-python cli.py geo                 # real worldwide coordinates
-python cli.py enrich              # real CVSS + CISA-KEV from cve.now
-python cli.py web                 # open http://127.0.0.1:5000  (and /map)
-
-# 1. Scan your own machine
-python cli.py scan 127.0.0.1
-
-# 2. Sweep a WHOLE network you control — the Shodan-style crawler
-python cli.py sweep 192.168.0.0/16 --ports top20 --rate 500
-
-# 2b. Or scan one subnet
-python cli.py scan 192.168.1.0/24 --ports top100
-
-# 3. Or just load the bundled demo dataset to explore the UI with no scanning
-python demo_seed.py
-
-# 4. (Optional) pull real CVSS scores + CISA-KEV flags from cve.now
-python cli.py enrich
-
-# 5. Launch the web UI
-python cli.py web
-# open http://127.0.0.1:5000
-```
-
-## Real data — without scanning the internet
-
-You don't have to scan the internet to populate Rennacs with real device data (you
-shouldn't — see the authorization boundary below). Instead, **import** it from an
-existing, authorized, legal source: Shodan's free, no-key
-[InternetDB](https://internetdb.shodan.io) API, which returns a summary of what Shodan
-already crawled for an IP — open ports, hostnames, CPEs (product/version), CVEs and tags.
+From the checkout, in Windows Git Bash:
 
 ```bash
-python cli.py import --starter             # a curated set of real public hosts
-python cli.py import 45.33.32.156 1.1.1.1  # specific IPs
-python cli.py import 192.0.2.0/28          # a CIDR (one lookup per host, ~1/s)
-python cli.py import @ips.txt              # a file of IPs
+python -m venv .venv
+.venv/Scripts/python.exe -m pip install -r requirements.txt
+
+.venv/Scripts/python.exe cli.py --db rennacs.db stats
+.venv/Scripts/python.exe cli.py --db rennacs.db web --host 127.0.0.1
 ```
 
-[rennacs/internetdb.py](rennacs/internetdb.py) maps each response into real host
-records: ports → services, CPEs → product/version + OS, the CVE list → real vuln tags
-(then enriched with CVSS/KEV by `cli.py enrich`), and Shodan's `tags` (e.g. `cloud`,
-`self-signed`, `honeypot`) — searchable with the new `tag:` filter. Every lookup is
-cached and hardened (allow-listed redirects, size cap, graceful fallback). Reading
-InternetDB is a passive database lookup, **not** a scan, so it isn't gated.
+Open <http://127.0.0.1:5000>. A fresh database shows zero hosts and services until
+you deliberately acquire observations. On Linux/macOS, substitute `.venv/bin/python`
+for `.venv/Scripts/python.exe`.
 
-Example: `import`-ing `scanme.nmap.org` pulls its real Apache 2.4.7 with ~140 real CVEs;
-`geo` places it in San Francisco; the world map and `has_vuln:true` light up with it.
+The root `--db` option must precede the command. Reuse the same path for acquisition,
+search, enrichment and serving; `RENNACS_DB` can also configure the Flask app factory.
+Back up an existing database before upgrading or reacquiring old inventory.
 
-## Network-wide sweeping — the crawler
+## Acquire real observations
 
-Shodan's defining capability is a crawler that continuously sweeps huge address spaces.
-[rennacs/sweep.py](rennacs/sweep.py) is the small, readable version of that engine,
-using the same techniques real internet scanners (zmap, masscan) rely on:
+### Authorized active TCP collection
+
+These commands contact only your own loopback interface:
 
 ```bash
-# Sweep a /16 (65k hosts) — streams with O(1) memory
-python cli.py sweep 10.0.0.0/16 -p top20 --rate 500 -c 300
-
-# Continuous re-crawl: sweep forever, 10 min between rounds (keeps the index fresh)
-python cli.py sweep 192.168.0.0/16 --repeat 0 --interval 600
-
-# Resume an interrupted sweep exactly where it stopped
-python cli.py sweep --resume 7
-
-python cli.py jobs                 # sweep / crawl history
+.venv/Scripts/python.exe cli.py --db rennacs.db scan 127.0.0.1 -p multiservice
+.venv/Scripts/python.exe cli.py --db rennacs.db sweep 127.0.0.1/32 -p multiservice --rate 50 --checkpoint-every 1
+.venv/Scripts/python.exe cli.py --db rennacs.db jobs
 ```
 
-- **Permuted scan order.** Addresses are visited in a pseudo-random permutation
-  (`(a·i + b) mod N`, `gcd(a,N)=1`) so load spreads evenly across the scope instead of
-  hammering one subnet — and it needs no host list in memory, so a /16 or larger streams
-  through fine.
-- **Global rate limiting.** A token bucket caps new connections/second across the whole
-  sweep (`--rate`), so you stay polite.
-- **Bounded concurrency** (`--concurrency`): a fixed worker pool, not a task per host.
-- **Resumable jobs.** A sweep is deterministic given `(scope, ports, seed)`, so resume =
-  "skip the first K permuted indices" — checkpointed to the DB and shown on the homepage
-  **Crawler activity** panel and `python cli.py jobs`.
+If nothing is listening, there may be no host/service records to search. For other
+scopes, select actual authorized targets, ports and a measured resource budget;
+public targets additionally require the authorization assertion described above.
 
-### The authorization boundary
+The default `multiservice` profile spans web, remote access, mail, databases and
+infrastructure. Other profiles include `web`, `remote`, `mail`, `databases`,
+`infrastructure`, `top20` and `top100`; combine profiles and port ranges as needed.
+`all-tcp` selects TCP ports 1 through 65535. Enumerating ports does **not** identify
+every protocol, cover UDP or test every vulnerability.
 
-"Network-wide" means *the networks you're allowed to scan*. The gate
-([rennacs/authz.py](rennacs/authz.py)) checks the **whole scope up front**: localhost and
-private (RFC1918) ranges sweep freely; a public range is refused unless you pass
-`--i-am-authorized` to assert you own it or have explicit permission (your own fleet /
-VPC, a sanctioned lab). Rennacs deliberately has no "scan the whole internet" mode and no
-way to disable the gate — mass-scanning hosts you don't own is abusive and, in many
-places, illegal. The engine shows you *how* crawling at scale works; the boundary keeps
-it pointed at scope you control.
-
-## Search query language
-
-Mirrors Shodan's `filter:value` syntax. Examples:
-
-| Query                         | Meaning                                        |
-|-------------------------------|------------------------------------------------|
-| `nginx`                       | free text across banners                       |
-| `port:22`                     | hosts with SSH open                            |
-| `product:OpenSSH`             | fingerprinted as OpenSSH                       |
-| `port:443 has_ssl:true`       | TLS services on 443                            |
-| `country:US org:"Google LLC"` | combine filters (quotes for spaces)            |
-| `net:192.168.1.0/24`          | everything in a subnet                         |
-| `-port:80 http`               | has "http" in a banner but NOT on port 80      |
-
-Supported filters: `port`, `product`, `version`, `hostname`, `ip`, `net`, `org`,
-`country`, `city`, `os`, `tag`, `has_ssl`, `ssl.cn`, `vuln`, `has_vuln`, `kev`,
-`before`, `after`, plus free text.
-
-## Vulnerability tags
-
-Each fingerprinted `(product, version)` is run through a small, hand-written CVE
-rule set ([rennacs/vulns.py](rennacs/vulns.py)). Matches show as CVE tags in the
-results list and an "⚠ Possible vulnerabilities" box on the host page, and are
-searchable with `has_vuln:true` or `vuln:CVE-2024-6387`.
-
-**This is a heuristic, advisory only.** It matches *version ranges* from a banner and
-cannot see backported patches or distro versioning, so it both misses real issues and
-flags patched hosts. It's here to show the *mechanism* (fingerprint → known-CVE
-lookup), not to be a scanner you'd act on.
-
-## Local advisory catalog and offline reassessment
-
-The separate local advisory catalog expands potential product/version correlation
-beyond the handwritten rules. Catalog acquisition is explicit and budgeted;
-scanning, status, reassessment and page views use only locally cached advisories.
-The homepage's recent critical/KEV feed is **not** catalog coverage.
+Sweeps use bounded workers, a connection-attempt token bucket, permuted traversal
+and persisted job configuration. Resume an interrupted job using its actual ID:
 
 ```bash
-# Root --db must precede the command.
-python cli.py --db rennacs.db catalog status --json                 # offline
-python cli.py --db rennacs.db catalog sync --max-pages 1 --max-requests 50 --rate 1 --json
-python cli.py --db rennacs.db catalog fetch CVE-2024-6387 --max-requests 50 --rate 1 --json
-python cli.py --db rennacs.db catalog assess 'product:OpenSSH' --limit 1000 --after-id 0 --json
-python cli.py --db rennacs.db findings 'product:OpenSSH' --json     # offline report
+.venv/Scripts/python.exe cli.py --db rennacs.db sweep --resume JOB_ID
 ```
 
-Repeat bounded `sync` batches to resume pending details and pagination; a single
-batch and a successful exit do not imply a complete catalog. Reassessment uses
-service-keyset progress: continue with its returned `after_id` while `has_more` is
-true, keeping the database/query and catalog revision consistent. A full traversal
-is not an atomic source snapshot. A fresh-list ID can temporarily return 404;
-failed details remain pending rather than being silently skipped.
+Resume restores saved ports, timeout, rate, concurrency, shuffle and checkpoint
+configuration. Its cursor is a safe contiguous prefix; out-of-order work beyond it
+may replay. Legacy jobs without safe configuration cannot be exactly resumed.
+Partial-port refreshes preserve unscanned services. A previously observed service
+that does not answer records `not_observed`, not a claim of closure or remediation.
 
-`GET /api/catalog` provides local status only; `/findings` shows coverage,
-reassessment timestamps and source/range/fix evidence. No API or page view starts
-a sync. Matches remain **potential / low confidence**, not proof of vulnerability,
-exploitation, a working fix or asset security. Source summaries may be model-written;
-check provenance, vendor guidance and redistribution/attribution rights before use.
-See [the catalog guide](docs/CATALOG.md) for defaults, validation, exit codes,
-restart/resume semantics, matching limits and source-license caveats. These commands
-do not change scan authorization or establish production/global coverage.
+`--repeat 0 --interval N` repeats after a completed round plus the requested delay.
+It is **not** a fixed weekly start time, a production scheduler or an overlap lock.
 
-## Live CVE data — cve.now integration
+### Explicit provider imports
 
-The heuristic above only *guesses* CVE IDs. [cve.now](https://cve.now) — a free,
-no-auth public feed merging CVE List, OSV, GitHub Advisories, NVD and CISA KEV — adds
-sourced advisory metadata, not proof that those guesses apply to a host. Run:
+Put actual IP addresses you have selected and are permitted to use in `ips.txt`,
+one per line. Import only those targets, with an explicit lookup budget:
 
 ```bash
-python cli.py enrich          # pulls authoritative data for your flagged CVEs
-python cli.py cve CVE-2024-6387   # look up a single CVE
+.venv/Scripts/python.exe cli.py --db rennacs.db import @ips.txt --max 25 --rate 1
+.venv/Scripts/python.exe cli.py --db rennacs.db geo --limit 25 --rate 1
+.venv/Scripts/python.exe cli.py --db rennacs.db enrich
 ```
 
-`enrich` does three things, then caches everything locally:
+`import` reads [Shodan InternetDB](https://internetdb.shodan.io). Imported ports,
+hostnames, CPEs, tags and CVE associations are **provider reports**, not observations
+made by Rennacs and not independently confirmed findings. No inventory or geographic
+spread is guaranteed. Lookup failures and missing fields remain missing; responses
+and acquisition metadata are cached locally. `--offline` uses existing cache only.
 
-1. **Enriches every flagged CVE** with the real CVSS score + vector, the CISA-KEV
-   *exploited-in-the-wild* flag, a sourced summary, and reference links. These show on
-   the results list and host pages, with a `cve.now ↗` source link.
-2. **Validates the version match** against cve.now's authoritative affected ranges. If
-   the detected version falls inside the affected window it's marked *✓ in affected
-   range*; if clearly outside, *version may be patched*; if the version schemes can't
-   be compared, it stays heuristic-only (we never *hide* a finding on a disagreement).
-3. **Caches the latest Critical/KEV feed** for the homepage "Latest critical
-   vulnerabilities" panel, plus catalog stats (total tracked, critical this week).
+Source acquisition time and service measurement time are different. InternetDB may
+not supply a measurement timestamp; Rennacs does not invent one from the fetch time.
+Supported acquisition provenance includes source identity, retrieval time, reference
+and payload digest. It supports attribution, not proof that a provider is correct.
 
-New `kev:true` filter finds services with a CISA Known-Exploited CVE.
+Existing rows without supported acquisition provenance are quarantined from search,
+statistics, maps and findings, rather than silently relabeled as real. The homepage
+and `GET /api/data-status` show sourced and quarantined host/service counts. Reacquire
+legacy inventory through authorized observation or a validated provider import; do
+not promote it by editing a label.
 
-**Design guarantees** (see [rennacs/cvenow.py](rennacs/cvenow.py)):
+### Geolocation
 
-- **Offline-first.** Scanning and page views *never* hit cve.now — they read the
-  local cache only. Source access is explicit through `enrich`, `cve`, or
-  `catalog sync` / `catalog fetch`.
-- **Graceful degradation.** Any network error falls back to cache, then to the
-  heuristic. cve.now being down never breaks Rennacs.
-- **Sends no inventory to cve.now.** Advisory lookups send public advisory IDs;
-  catalog traversal also sends opaque pagination cursors. No scan data, host info
-  or credentials are uploaded. No API key or account is required.
-- **No new dependencies, SSRF-aware.** Uses only the stdlib `urllib`. Every CVE ID is
-  validated before it enters a request URL; redirects are constrained to the cve.now
-  host set (never an arbitrary or private host); responses are size-capped; and every
-  read/parse/redirect failure degrades to cache, then heuristic — cve.now being down,
-  slow, or hostile never breaks or hangs Rennacs.
+Indexing performs no network geolocation. Public locations come from an optional
+MaxMind GeoLite2 database (`geoip2` and `RENNACS_GEOLITE2`/`GeoLite2-City.mmdb`) or an
+explicit `geo` lookup through ipwho.is. Public IPs have no hard-coded geographic
+fallback. Private/loopback labels classify address scope, not a physical location.
+Missing coordinates stay unknown and do not acquire a map marker. Geolocation is
+approximate provider metadata, not proof of ownership or physical presence.
 
-> This integration was hardened after an adversarial multi-agent review of the network,
-> SQL, caching and offline-fallback paths; the regression tests in `tests/test_cvenow.py`
-> lock in those fixes (cache not clobbered by a malformed `200`, stale-cache fallback on
-> transient errors, redirect/size guards, version-range validation).
-
-## Global map
-
-`/map` is a world map of the index with **clustered** markers (Leaflet + OpenStreetMap,
-theme-darkened), coloured red when a host has a flagged service, plus a country
-breakdown. It's **query-filtered** — `/map?q=port:443 country:US` (Shodan's "View on
-Map", linked from every results page) — and lists private / lab hosts separately since
-they have no public location.
-
-Real geolocation comes in two layers ([rennacs/geoip.py](rennacs/geoip.py)):
-
-- **Offline** (`enrich`, used at index time, never blocks a sweep): loopback/private
-  labels, a few known IPs, and an optional **MaxMind GeoLite2** DB if present
-  (`RENNACS_GEOLITE2` or `GeoLite2-City.mmdb`).
-- **Network** (`cli.py geo`): real coordinates for every public host via a free, keyless
-  API (ipwho.is), cached and hardened, updating each host's lat/lon/country/city/org.
-  Private/loopback addresses are never geolocated (they have no public location).
+## Search and local reports
 
 ```bash
-python cli.py geo          # place the public hosts in the index on the world map
+.venv/Scripts/python.exe cli.py --db rennacs.db search 'port:22 product:OpenSSH'
+.venv/Scripts/python.exe cli.py --db rennacs.db findings 'product:OpenSSH' --json
 ```
 
-## How it maps to Shodan
+The query language supports free text and combined `filter:value` expressions:
 
-| Shodan concept            | Rennacs equivalent                          |
-|---------------------------|---------------------------------------------|
-| Global crawlers           | `scanner.py` + `sweep.py` (scale engine)    |
-| Continuous re-crawl       | `sweep --repeat 0 --interval` + scan jobs   |
-| Service fingerprint DB    | `fingerprint.py` (regex rules → product)    |
-| Banner / host "document"  | one JSON row per host in `db.py`            |
-| `shodan.io/host/<ip>`     | `/host/<ip>` detail page                    |
-| Filter reference          | `query.py` parser                           |
-| `vuln:` tags / CVEs       | `vulns.py` (version-range heuristics)       |
-| Real CVSS / CVE data      | `cvenow.py` (live cve.now enrichment)       |
-| CISA-KEV / `vuln:` detail | `cve.now` exploited flag + sourced summary  |
-| Shodan Maps + View on Map | `/map?q=` (clustered, query-filtered)       |
-| GeoIP enrichment          | `geoip.py` (ipwho.is live + MaxMind option) |
-| Real device data / import | `internetdb.py` (Shodan InternetDB, free)   |
-| `tag:` filter             | tags from InternetDB (`cloud`, `honeypot`…) |
+| Query | Meaning within recorded inventory |
+|---|---|
+| `port:22` | Recorded services on port 22 |
+| `product:OpenSSH` | Services identified as OpenSSH |
+| `port:443 has_ssl:true` | Recorded TLS services on port 443 |
+| `net:192.168.1.0/24` | Restrict to an indexed subnet; does not scan it |
+| `country:US` | Services with that sourced country code |
+| `has_vuln:true` | Services with advisory associations |
+| `kev:true` | Services with a KEV-linked advisory; not proof of host exploitation |
 
-## Files
+Other filters include `version`, `hostname`, `ip`, `org`, `city`, `os`, `tag`,
+`ssl.cn`, `vuln`, `before` and `after`; `-filter:value` negates a filter.
 
-- `rennacs/scanner.py` — async scanner + banner grabber with the authorization gate
-- `rennacs/sweep.py` — network-wide sweep engine (permuted order, rate limit, resume)
-- `rennacs/fingerprint.py` — turns raw banners into product/version/os guesses
-- `rennacs/db.py` — SQLite-backed index (the "search engine" storage)
-- `rennacs/query.py` — Shodan-style filter query → SQL
-- `rennacs/geoip.py` — geo enrichment: offline (MaxMind) + live geolocation (ipwho.is)
-- `rennacs/internetdb.py` — import real host data from Shodan InternetDB (no scanning)
-- `rennacs/_http.py` — shared hardened HTTP helper (redirect allowlist, size cap)
-- `rennacs/app.py` — Flask web UI + JSON API
-- `cli.py` — command-line entry point (`scan`, `web`, `search`)
-- `rennacs/vulns.py` — heuristic CVE tagging from (product, version)
-- `rennacs/cvenow.py` — live cve.now client (enrichment, feed, cache, offline fallback)
-- `rennacs/catalog.py` — lossless local advisory details and bounded resumable ingestion
-- `rennacs/matching.py` — conservative product-bound offline advisory correlation
-- `docs/CATALOG.md` — catalog commands, coverage/reassessment semantics and limitations
-- `demo_seed.py` — loads a realistic demo dataset so the UI works with no scanning
-- `tests/` — pytest suite (query, authz, fingerprint, vulns, cvenow, db, API)
+UI routes include `/search`, `/host/<ip>`, `/map` and `/findings`. JSON routes include
+`/api/search`, `/api/host/<ip>`, `/api/host/<ip>/history`, `/api/stats`, `/api/map`,
+`/api/findings`, `/api/jobs`, `/api/catalog` and `/api/data-status`. Page views read
+local inventory/advisory caches; they do not initiate scans or advisory syncs.
+Findings totals count **service assessments**, not individual CVEs.
+
+The map shows only records with available coordinates and respects the search query.
+Map assets/tiles can require external browser requests; offline inventory reads do
+not mean the browser has a fully offline basemap.
+
+## Advisory catalog and enrichment
+
+Product/version correlations from banners, imported CVE tags and cached advisories
+are **potential / low-confidence assessments**, not proof of vulnerability,
+compromise, exploitation, a working fix or asset security. Banner matching cannot
+resolve all vendor editions, distribution backports, configurations or prerequisites.
+Unknown and untested do not mean secure. Review vendor guidance and original evidence
+before making remediation decisions.
+
+[cve.now](https://cve.now) supplies advisory metadata and a separately cached recent
+critical/KEV feed. `enrich` refreshes metadata for already associated CVE IDs and that
+feed; feed size or source-wide statistics are **not local catalog coverage**. Scanning,
+status, reassessment and page views use locally cached advisories. Acquisition is an
+explicit, budgeted CLI operation:
+
+```bash
+.venv/Scripts/python.exe cli.py --db rennacs.db catalog status --json
+.venv/Scripts/python.exe cli.py --db rennacs.db catalog sync --max-pages 1 --max-requests 50 --rate 1 --json
+.venv/Scripts/python.exe cli.py --db rennacs.db catalog fetch CVE-2024-6387 --max-requests 50 --rate 1 --json
+.venv/Scripts/python.exe cli.py --db rennacs.db catalog assess 'product:OpenSSH' --limit 1000 --after-id 0 --json
+```
+
+Repeat bounded sync batches to resume pending details and pagination. One successful
+batch is not a complete catalog. Failed/malformed details remain pending. A completed
+source traversal is not an atomic/current snapshot or complete vulnerability coverage.
+For reassessment, continue with returned `after_id` while `has_more` is true, keeping
+the query/database and catalog revision consistent. Observation times do not become
+reassessment times. Source summaries may be model-written; check source provenance,
+vendor references, attribution and redistribution terms.
+
+See [docs/CATALOG.md](docs/CATALOG.md) for defaults, matching boundaries, restart/resume
+semantics, source-license caveats and exit codes.
+
+## Production limits and future SaaS
+
+The goal is broad IPv4 service coverage operated from the local scanner, with a
+separate customer-facing service. That architecture is not implemented as a SaaS.
+The offline `plan public-ipv4` command estimates TCP workloads; it never probes
+targets or grants authorization. Its static candidate policy is not a live BGP
+routability or executable opt-out-aware scan manifest.
+
+Weekly exhaustive global TCP coverage has not been demonstrated and is not enabled.
+The all-port traffic budget in [docs/BUILD.md](docs/BUILD.md) exceeds the current
+PC/link operating assumptions; local tests are not Internet-scale benchmarks.
+
+Not implemented:
+
+- Protocol-aware broad UDP discovery, exhaustive protocol/vulnerability identification
+  or a fast native global discovery backend.
+- An executable routing/exclusion/opt-out manifest, verified ISP operating policy,
+  measured global capacity, production scheduler or no-overlap enforcement.
+- Production-scale retention, sharded ingestion/search, an outbound authenticated
+  worker upload queue or a hosted customer deployment.
+- SaaS authentication, tenant isolation, verified asset ownership, consent records,
+  quotas, billing, monitoring and operational abuse/opt-out handling.
+- Intrusive confirmation, automatic patching, remote system modification or
+  remediation workflows with owner approval, rollback and scoped retesting.
+
+Responsible disclosure and opt-out handling must not depend on purchasing a service.
+Do not turn an advisory correlation into a claim of compromise or a demand for payment.
 
 ## Tests
 
 ```bash
-pip install -r requirements-dev.txt
-pytest
+.venv/Scripts/python.exe -m pip install -r requirements-dev.txt
+.venv/Scripts/python.exe -m pytest
+.venv/Scripts/python.exe -m pytest tests/test_multiservice_e2e.py -s
 ```
 
-The test suite covers the query compiler (including SQL-injection safety), the authorization
-gate (per-host and whole-network), fingerprinting, the vuln heuristics, the cve.now
-client, the geolocation client and the Shodan-InternetDB importer (CPE parsing, real-CVE
-mapping, caching — all with mocked fetchers, no live network in CI), the sweep engine
-(addressing, permutation bijection, rate limiting, resume, job history), the
-query-filtered world map, enriched page rendering, the index/search layer, schema
-migration, and the web API.
-
-For educational use only. See the authorization notes above.
+The suite uses temporary databases, synthetic inventory, mocked provider responses
+and explicitly loopback HTTP/TLS/SSH/SMTP/Redis fixtures. Those inputs are not public
+host findings and never populate a user index. Regression tests cover acquisition
+provenance, quarantine, fresh zero-data UI/API behavior, authorization, query safety,
+fingerprinting, refresh/resume, geolocation and advisory caching/matching. No public
+scan or recurring task is required to run the test suite.

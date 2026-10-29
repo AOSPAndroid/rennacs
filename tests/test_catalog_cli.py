@@ -1,4 +1,5 @@
 """Catalog CLI/API/UI exercise real SQLite; only external fetches are mocked."""
+from tests.inventory_fixture import with_test_source
 
 import gc
 import json
@@ -137,9 +138,9 @@ def test_findings_ui_shows_catalog_coverage_reassessment_and_escaped_evidence(tm
     try:
         idx.catalog.upsert(advisory())
         idx.conn.commit()
-        idx.insert_raw({"ip": "127.0.0.1", "seen_at": seen, "services": [
+        idx.insert_raw(with_test_source({"ip": "127.0.0.1", "seen_at": seen, "services": [
             {"port": 12345, "product": "Fixture Server", "version": "1.5", "vulns": [
-                {"cve": "CVE-2099-22222", "source": hostile}]}]})
+                {"cve": "CVE-2099-22222", "source": hostile}]}]}))
         service = idx.host("127.0.0.1")["services"][0]
         idx.update_catalog_matches(service["id"], [{
             "cve": "CVE-2099-12345", "catalog_id": "CVE-2099-12345",
@@ -234,10 +235,10 @@ def test_assess_is_offline_keyset_progress_and_preserves_observation_time(tmp_pa
     idx = Index(path)
     seen = "2026-01-02T03:04:05Z"
     try:
-        idx.insert_raw({"ip": "127.0.0.1", "seen_at": seen, "services": [
+        idx.insert_raw(with_test_source({"ip": "127.0.0.1", "seen_at": seen, "services": [
             {"port": 12345, "product": "Fixture Server", "version": "1.5", "vulns": []},
             {"port": 12346, "product": "Fixture Server", "version": "1.6", "vulns": []},
-            {"port": 12347, "product": "Other Server", "version": "1.6", "vulns": []}]})
+            {"port": 12347, "product": "Other Server", "version": "1.6", "vulns": []}]}))
         idx.catalog.upsert(advisory())
         idx.conn.commit()
         before = idx.host("127.0.0.1")

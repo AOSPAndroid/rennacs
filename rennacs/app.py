@@ -49,6 +49,7 @@ def create_app(db_path: str | None = None) -> Flask:
         cvenow = CVENow(app.config["DB_PATH"], offline=True)  # read cache only
         try:
             stats = idx.stats()
+            data_status = idx.data_status()
             feed = cvenow.latest(10)
             catalog = cvenow.catalog_stats()
             feed_at = cvenow.feed_fetched_at()
@@ -58,7 +59,7 @@ def create_app(db_path: str | None = None) -> Flask:
             cvenow.close()
         return render_template("index.html", stats=stats, examples=EXAMPLES,
                                cve_feed=feed, catalog=catalog, feed_at=feed_at,
-                               jobs=jobs)
+                               jobs=jobs, data_status=data_status)
 
     @app.route("/search")
     def search():
@@ -127,6 +128,15 @@ def create_app(db_path: str | None = None) -> Flask:
         finally:
             idx.close()
         return render_template("findings.html", q=q, data=data, error=error, page=page)
+
+    @app.get("/api/data-status")
+    def api_data_status():
+        """Local source/quarantine counts, never a scan or trust-promotion endpoint."""
+        idx = index()
+        try:
+            return jsonify(idx.data_status())
+        finally:
+            idx.close()
 
     @app.get("/api/catalog")
     def api_catalog():

@@ -17,7 +17,7 @@ A reported version is not proof of exposure; distribution backports and configur
   <p>Listing exhausted: {{ data.catalog.listing_exhausted }} · traversal complete: {{ data.catalog.complete }}.
     This is not an atomic snapshot, a complete vulnerability assessment or proof of asset security.</p>
   <p>Traversal started: {{ data.catalog.started_at or 'not started' }} ·
-    last catalog progress: {{ data.catalog.updated_at or 'never' }}.
+    last catalog-state activity: {{ data.catalog.updated_at or 'never' }}.
     <a href="{{ url_for('api_catalog') }}">Local catalog status JSON</a></p>
   {% if data.catalog.last_error %}<p>Last catalog error: {{ data.catalog.last_error.message }}</p>{% endif %}
   <p>Page views never sync or reassess. Use the explicit catalog CLI to update local evidence.</p>
@@ -32,7 +32,10 @@ A reported version is not proof of exposure; distribution backports and configur
     <span>{{ f.evidence.product }} {{ f.evidence.version }}</span>
   </header>
   <div class="vuln-box">
-    <p>Observed: {{ f.evidence.observed_at }}. No exploit test performed.</p>
+    <p>Observed: {{ f.evidence.observed_at or 'not supplied by source' }}. No exploit test performed.</p>
+    {% if f.evidence.provenance.source %}<p>Observation source: {{ f.evidence.provenance.source }} ·
+      source retrieved: {{ f.evidence.provenance.retrieved_at or 'unknown' }}.
+      Retrieval time is not necessarily the provider's observation time.</p>{% endif %}
     <p>Catalog assessed: {{ f.evidence.catalog_checked_at or 'never' }} · revision {{ f.evidence.catalog_revision }}.
       Assessment time is not a new network observation; later catalog updates require reassessment.</p>
     <ul>{% for v in f.advisories %}

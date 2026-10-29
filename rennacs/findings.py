@@ -18,6 +18,12 @@ def assess_service(row: dict) -> dict:
     ip, port = row["ip"], row["port"]
     transport = row.get("transport") or "tcp"
     identity = f"{ip}|{port}|{transport}".encode("utf-8")
+    provenance = row.get("provenance")
+    if not isinstance(provenance, dict):
+        provenance = {}
+    source_evidence = {key: provenance.get(key) for key in (
+        "kind", "source", "reference", "retrieved_at", "observed_at", "payload_sha256",
+    )}
     advisories = []
     for vuln in row.get("vulns") or []:
         if not isinstance(vuln, dict):
@@ -68,6 +74,7 @@ def assess_service(row: dict) -> dict:
         },
         "evidence": {
             "observed_at": row.get("seen_at"),
+            "provenance": source_evidence,
             "catalog_checked_at": row.get("catalog_checked_at"),
             "catalog_revision": row.get("catalog_revision", 0),
             "product": row.get("product") or "",

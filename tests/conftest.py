@@ -14,8 +14,8 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
 
-from rennacs.db import Index   # noqa: E402
-import demo_seed               # noqa: E402
+from rennacs.db import Index                              # noqa: E402
+from inventory_fixture import TEST_DATA, with_test_source  # noqa: E402
 
 
 @pytest.fixture
@@ -28,11 +28,11 @@ def empty_index(tmp_path):
 
 @pytest.fixture
 def seeded_index(tmp_path):
-    """An index preloaded with the demo dataset."""
+    """Synthetic inventory in a throwaway database, never the production index."""
     path = str(tmp_path / "seeded.db")
     idx = Index(path)
-    for doc in demo_seed.DEMO:
-        idx.insert_raw(doc)
+    for doc in TEST_DATA:
+        idx.insert_raw(with_test_source(doc))
     idx.close()
     # reopen read-only-ish for the test
     idx = Index(path)
@@ -45,8 +45,8 @@ def client(tmp_path):
     """A Flask test client over a seeded database."""
     path = str(tmp_path / "web.db")
     idx = Index(path)
-    for doc in demo_seed.DEMO:
-        idx.insert_raw(doc)
+    for doc in TEST_DATA:
+        idx.insert_raw(with_test_source(doc))
     idx.close()
     from rennacs.app import create_app
     app = create_app(path)
@@ -56,14 +56,15 @@ def client(tmp_path):
 
 @pytest.fixture
 def demo():
-    return demo_seed.DEMO
+    """Compatibility fixture for existing test parameters; synthetic test data only."""
+    return TEST_DATA
 
 
 # -- cve.now enrichment, with a fake fetcher (no network) ----------------------
 
 import urllib.error  # noqa: E402
 
-# Canned cve.now entries for the CVEs the demo dataset flags.
+# Canned cve.now entries for the CVEs the synthetic inventory flags.
 _FAKE_ENTRIES = {
     "CVE-2024-6387": {
         "id": "CVE-2024-6387", "title": "OpenSSH regreSSHion RCE",
@@ -139,8 +140,8 @@ def enriched_client(tmp_path):
     from rennacs.cvenow import CVENow
     path = str(tmp_path / "enriched.db")
     idx = Index(path)
-    for doc in demo_seed.DEMO:
-        idx.insert_raw(doc)
+    for doc in TEST_DATA:
+        idx.insert_raw(with_test_source(doc))
     c = CVENow(path, now_iso="2026-10-27T00:00:00Z")
     c._get_json = FakeNet()
     idx.reenrich(c, allow_network=True)     # warms cache, then merges

@@ -14,7 +14,9 @@
 
 {% if not rows and not error %}
 <div class="empty-note">
-  No matches. Try a broader query, or load demo data with <code>python demo_seed.py</code>.
+  No matches in the recorded observations. Try a broader query. If the index is empty,
+  collect observations with an authorized scan or import records from a source you
+  are permitted to use. See the <a href="{{ url_for('home') }}">index setup instructions</a>.
 </div>
 {% endif %}
 
@@ -37,7 +39,7 @@
         {% if r.org %}<span>{{ r.org }}</span>{% endif %}
         {% if r.country %}<span>{{ r.country }}{% if r.city %}, {{ r.city }}{% endif %}</span>{% endif %}
         {% if r.os %}<span>{{ r.os }}</span>{% endif %}
-        <span class="seen">{{ r.seen_at[:10] }}</span>
+        <span class="seen">Observed: {{ r.seen_at[:10] if r.seen_at else 'not supplied by source' }}</span>
       </div>
       {% if r.banner %}<pre class="banner">{{ r.banner[:600] }}</pre>{% endif %}
     </div>

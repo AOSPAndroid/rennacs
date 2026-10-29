@@ -1,4 +1,5 @@
 """Catalog storage is separate from legacy/import evidence and scan timestamps."""
+from tests.inventory_fixture import with_test_source
 import json
 import sqlite3
 
@@ -17,7 +18,7 @@ def test_catalog_cache_does_not_reuse_rolled_back_revision(empty_index, rollback
     empty_index.catalog.upsert(raw)
     if rollback == "insert_failure":
         with pytest.raises(sqlite3.IntegrityError):
-            empty_index.insert_raw(dict(doc, services=doc["services"] * 2))
+            empty_index.insert_raw(with_test_source(dict(doc, services=doc["services"] * 2)))
     else:
         matches = empty_index._catalog_matches("Fixture Server", "1.5", revision=1)
         assert [item["cve"] for item in matches] == [raw["id"]]
@@ -29,7 +30,7 @@ def test_catalog_cache_does_not_reuse_rolled_back_revision(empty_index, rollback
     empty_index.catalog.upsert(dict(raw, id=replacement))
     empty_index.conn.commit()
     assert empty_index.catalog.revision() == 1
-    empty_index.insert_raw(doc)
+    empty_index.insert_raw(with_test_source(doc))
     stored = empty_index.host("127.0.0.1")["services"][0]
     assert [item["cve"] for item in stored["catalog_vulns"]] == [replacement]
     assert stored["catalog_vulns"][0]["catalog_provenance"] == empty_index.catalog.provenance(replacement)
@@ -42,10 +43,10 @@ def test_duplicate_id_preserves_positive_legacy_kev(empty_index, positive_eviden
     empty_index.catalog.upsert({"id": identifier, "affected": [
         {"product": "Fixture Server", "versions": ["1.5"]}]})
     empty_index.conn.commit()
-    empty_index.insert_raw({"ip": "127.0.0.1", "seen_at": seen, "services": [
+    empty_index.insert_raw(with_test_source({"ip": "127.0.0.1", "seen_at": seen, "services": [
         {"port": 80, "product": "Fixture Server", "version": "1.5", "vulns": [
             {"cve": identifier, "source": "fixture-import", "kev": positive_evidence == "import"}]},
-    ]})
+    ]}))
     before = empty_index.host("127.0.0.1")
     if positive_evidence == "reenrichment":
         class PositiveCache:
@@ -79,8 +80,8 @@ def test_catalog_survives_caller_initialization_rollback_without_committing_host
     empty_index.conn.rollback()
     assert empty_index.host("127.0.0.2") is None
 
-    empty_index.insert_raw({"ip": "127.0.0.1", "services": [{"port": 80,
-        "product": "Fixture Server", "version": "1.5", "vulns": []}]})
+    empty_index.insert_raw(with_test_source({"ip": "127.0.0.1", "services": [{"port": 80,
+        "product": "Fixture Server", "version": "1.5", "vulns": []}]}))
     assert empty_index.host("127.0.0.1")["services"][0]["catalog_vulns"] == []
     assert empty_index.catalog is catalog
     assert catalog.status()["revision"] == 0
@@ -94,9 +95,9 @@ def test_catalog_matches_refresh_without_destroying_legacy_or_observation_time(e
     match = {"cve": "CVE-2099-10002", "catalog_id": "CVE-2099-10002",
              "source": "cve.now-catalog", "match_status": "affected", "confirmed": "yes",
              "severity": "high", "kev": True}
-    empty_index.insert_raw({"ip": "127.0.0.1", "seen_at": seen, "services": [
+    empty_index.insert_raw(with_test_source({"ip": "127.0.0.1", "seen_at": seen, "services": [
         {"port": 80, "product": "Fixture Server", "version": "1.5", "vulns": [legacy]},
-    ]})
+    ]}))
     service = empty_index.host("127.0.0.1")["services"][0]
     empty_index.update_catalog_matches(service["id"], [match], revision=1)
     stored = empty_index.host("127.0.0.1")["services"][0]
@@ -143,9 +144,9 @@ def test_new_scan_automatically_matches_cached_advisories_without_network(empty_
 
 
 def test_catalog_reassessment_uses_keyset_without_touching_observations(empty_index):
-    empty_index.insert_raw({"ip": "127.0.0.1", "seen_at": "2026-10-28T00:00:00Z",
+    empty_index.insert_raw(with_test_source({"ip": "127.0.0.1", "seen_at": "2026-10-28T00:00:00Z",
         "services": [{"port": p, "product": "Fixture Server", "version": "1.5", "vulns": []}
-                     for p in (80, 81, 82)]})
+                     for p in (80, 81, 82)]}))
     empty_index.catalog.upsert({"id": "CVE-2099-10004", "affected": [
         {"product": "Fixture Server", "ranges": [{"introduced": "1.0", "fixed": "2.0"}]}]})
     first = empty_index.reassess_catalog(limit=2)
@@ -165,9 +166,9 @@ def test_catalog_reassessment_uses_keyset_without_touching_observations(empty_in
 def test_raw_inventory_insert_uses_local_catalog_and_keeps_imported_tags(empty_index):
     empty_index.catalog.upsert({"id": "CVE-2099-10005", "affected": [
         {"product": "Fixture Server", "versions": ["1.5"]}]})
-    empty_index.insert_raw({"ip": "127.0.0.1", "services": [{"port": 80,
+    empty_index.insert_raw(with_test_source({"ip": "127.0.0.1", "services": [{"port": 80,
         "product": "Fixture Server", "version": "1.5", "vulns": [
-            {"cve": "CVE-2099-10006", "source": "import"}]}]})
+            {"cve": "CVE-2099-10006", "source": "import"}]}]}))
     service = empty_index.host("127.0.0.1")["services"][0]
     assert {v["cve"] for v in service["vulns"]} == {"CVE-2099-10005", "CVE-2099-10006"}
     assert len(service["catalog_vulns"]) == 1
@@ -181,9 +182,9 @@ def test_legacy_enrichment_cannot_clear_catalog_kev(empty_index):
 
     empty_index.catalog.upsert({"id": "CVE-2099-10007", "exploitation": {"kev": True},
         "affected": [{"product": "Fixture Server", "versions": ["1.5"]}]})
-    empty_index.insert_raw({"ip": "127.0.0.1", "services": [{"port": 80,
+    empty_index.insert_raw(with_test_source({"ip": "127.0.0.1", "services": [{"port": 80,
         "product": "Fixture Server", "version": "1.5", "vulns": [
-            {"cve": "CVE-2099-10008", "source": "import"}]}]})
+            {"cve": "CVE-2099-10008", "source": "import"}]}]}))
     empty_index.reenrich(CacheOnly())
     service = empty_index.host("127.0.0.1")["services"][0]
     assert service["kev"] == 1
@@ -194,8 +195,8 @@ def test_reassessment_invalidates_cached_match_after_advisory_withdrawal(empty_i
     raw = {"id": "CVE-2099-10009", "affected": [
         {"product": "Fixture Server", "versions": ["1.5"]}]}
     empty_index.catalog.upsert(raw)
-    empty_index.insert_raw({"ip": "127.0.0.1", "services": [{"port": 80,
-        "product": "Fixture Server", "version": "1.5", "vulns": []}]})
+    empty_index.insert_raw(with_test_source({"ip": "127.0.0.1", "services": [{"port": 80,
+        "product": "Fixture Server", "version": "1.5", "vulns": []}]}))
     before = empty_index.host("127.0.0.1")["services"][0]
     assert len(before["catalog_vulns"]) == 1
     empty_index.catalog.upsert(dict(raw, status="withdrawn"))
@@ -211,7 +212,7 @@ def test_persisted_match_records_original_catalog_fetch_provenance(empty_index):
     empty_index.catalog.upsert({"id": "CVE-2099-10010", "affected": [
         {"product": "Fixture Server", "versions": ["1.5"]}]})
     provenance = empty_index.catalog.provenance("CVE-2099-10010")
-    empty_index.insert_raw({"ip": "127.0.0.1", "services": [{"port": 80,
-        "product": "Fixture Server", "version": "1.5", "vulns": []}]})
+    empty_index.insert_raw(with_test_source({"ip": "127.0.0.1", "services": [{"port": 80,
+        "product": "Fixture Server", "version": "1.5", "vulns": []}]}))
     match = empty_index.host("127.0.0.1")["services"][0]["catalog_vulns"][0]
     assert match["catalog_provenance"] == provenance

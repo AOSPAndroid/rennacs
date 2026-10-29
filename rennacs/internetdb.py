@@ -1,66 +1,36 @@
-"""Import REAL host data from Shodan InternetDB — real device data, no scanning.
+"""Passive imports from Shodan InternetDB, with retained provider evidence.
 
-The honest way to populate Rennacs with real internet-device data is NOT to scan the
-internet yourself (abusive, and often illegal) — it's to read an existing, authorized,
-legal data source. Shodan's `InternetDB <https://internetdb.shodan.io>`_ is a free,
-no-API-key endpoint that returns a lightweight summary of what Shodan already crawled
-for an IP: open ports, hostnames, CPEs (product/version), CVEs, and tags.
+The provider reports host-level ports, hostnames, CPEs, CVEs and tags. It supplies
+neither per-port product/advisory bindings nor transport, TLS or observation times.
+Keep these unknown: host assertions are not measured service vulnerabilities.
 
-This module turns that into Rennacs host records:
-
-* each open port becomes a service (product/version mapped from CPEs by typical port),
-* the CPE OS becomes the host's OS,
-* InternetDB's CVE list becomes real vuln tags (then enriched by :mod:`rennacs.cvenow`),
-* hostnames and tags are stored for display and the ``tag:`` filter.
-
-It reuses the hardened HTTP helper (host-allowlisted redirects, size cap) and caches
-every lookup, so re-imports are free and the tool degrades gracefully if the API is
-unreachable. Reading InternetDB is a passive database lookup, not a scan, so it isn't
-gated by the scan-authorization policy.
+Successful imports retain the raw JSON, its canonical UTF-8 SHA256 and the actual
+retrieval timestamp. Cache hits revalidate that evidence and preserve its time;
+legacy normalized-only entries must be fetched again, never relabeled as fresh.
+No targets or synthetic fallback records are loaded automatically. Provider access
+uses a host-allowlisted, size-capped fetcher. Redistribution terms remain separate
+from technical access to the API.
 """
 
 from __future__ import annotations
 
+import hashlib
 import ipaddress
 import json
 import re
 import sqlite3
 import time
+from datetime import datetime, timezone
 
 from ._http import FETCH_ERRORS, SafeFetcher
 from .ports import SERVICE_NAMES
 
 BASE = "https://internetdb.shodan.io"
-_TLS_PORTS = {443, 465, 636, 993, 995, 8443, 9443}
-_CVE_RE = re.compile(r"^CVE-\d{4}-\d{4,}$", re.I)
 
-# CPE product token -> (display name, typical ports) so we can attach a product/version
-# to the right open port. Unknown products are title-cased and attached to any port.
-_CPE_APP = {
-    "openssh": ("OpenSSH", [22]),
-    "http_server": ("Apache httpd", [80, 8080, 8000, 443, 8443]),
-    "nginx": ("nginx", [80, 8080, 8000, 443, 8443]),
-    "lighttpd": ("lighttpd", [80, 443]),
-    "ntp": ("NTP", [123]),
-    "mysql": ("MySQL", [3306]),
-    "mariadb": ("MariaDB", [3306]),
-    "postgresql": ("PostgreSQL", [5432]),
-    "redis": ("Redis", [6379]),
-    "exim": ("Exim", [25, 465, 587]),
-    "postfix": ("Postfix", [25, 465, 587]),
-    "dovecot": ("Dovecot", [110, 143, 993, 995]),
-    "vsftpd": ("vsftpd", [21]),
-    "proftpd": ("ProFTPD", [21]),
-    "internet_information_services": ("Microsoft IIS", [80, 443, 8080, 8443]),
-    "iis": ("Microsoft IIS", [80, 443, 8080, 8443]),
-    "cloudflare": ("Cloudflare", [80, 443, 8080, 8443]),
-    "openssl": ("OpenSSL", [443, 8443, 993, 995]),
-}
-_CPE_OS = {
-    "ubuntu_linux": "Ubuntu", "debian_linux": "Debian", "windows": "Windows",
-    "centos": "CentOS", "fedora": "Fedora", "freebsd": "FreeBSD",
-    "linux_kernel": "Linux", "mac_os_x": "macOS",
-}
+_CVE_RE = re.compile(r"CVE-[0-9]{4}-[0-9]{4,}")
+_CPE_URI = re.compile(r"cpe:/[aoh](?::(?:[A-Za-z0-9._~*-]|%[0-9A-Fa-f]{2})*){2,6}")
+_CPE_FORMATTED = re.compile(r"cpe:2\.3:[aoh](?::(?:[A-Za-z0-9._?*-]|\\[^\s])+){10}")
+
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS idb_cache (
@@ -73,80 +43,97 @@ CREATE TABLE IF NOT EXISTS idb_cache (
 
 
 def _parse_cpe(cpe: str):
-    """cpe:/a:openbsd:openssh:6.6.1p1 -> ('a', 'openssh', '6.6.1p1'). Best-effort."""
-    s = cpe.strip()
-    if s.startswith("cpe:2.3:"):
-        parts = s.split(":")          # cpe:2.3:a:vendor:product:version:...
-        if len(parts) >= 6:
-            return parts[2], parts[4].lower(), (parts[5] if parts[5] != "*" else "")
+    """Parse supported, complete CPE tokens; never repair malformed source IDs."""
+    if not isinstance(cpe, str):
         return "", "", ""
-    m = re.match(r"cpe:/([aoh]):([^:]*):([^:]*)(?::([^:]*))?", s)
-    if not m:
-        return "", "", ""
-    return m.group(1), (m.group(3) or "").lower(), (m.group(4) or "")
+    if _CPE_FORMATTED.fullmatch(cpe):
+        parts = re.findall(r"(?:\\[^\s]|[^:\\\s])+", cpe)
+        return parts[2], parts[4], (parts[5] if parts[5] != "*" else "")
+    if _CPE_URI.fullmatch(cpe):
+        parts = cpe[5:].split(":")
+        if parts[1] and parts[2]:
+            return parts[0], parts[2], parts[3] if len(parts) > 3 else ""
+    return "", "", ""
 
 
-def normalize(ip: str, raw: dict) -> dict:
-    """Turn an InternetDB response into a Rennacs host document (real data)."""
-    ports = sorted({int(p) for p in (raw.get("ports") or []) if _is_port(p)})
-    hostnames = [h for h in (raw.get("hostnames") or []) if h][:12]
-    tags = [t for t in (raw.get("tags") or []) if t][:16]
-    vulns = [c.upper() for c in (raw.get("vulns") or []) if _CVE_RE.match(str(c))]
+def _text_token(value) -> bool:
+    return (isinstance(value, str) and bool(value) and value == value.strip()
+            and value.isprintable())
 
-    os_name = ""
-    apps = []     # (display, version, typical_ports)
-    for cpe in (raw.get("cpes") or []):
-        kind, product, version = _parse_cpe(cpe)
-        if not product:
-            continue
-        if kind == "o":
-            os_name = os_name or _CPE_OS.get(product, product.replace("_", " ").title())
-        elif kind == "a":
-            disp, pports = _CPE_APP.get(product, (product.replace("_", " ").title(), []))
-            apps.append((disp, version, pports))
 
-    services = []
-    for p in ports:
-        svc = {"port": p, "transport": "tcp", "service": SERVICE_NAMES.get(p, ""),
-               "os": os_name, "has_ssl": p in _TLS_PORTS, "vulns": []}
-        for disp, ver, pports in apps:
-            if p in pports:
-                svc["product"], svc["version"] = disp, ver
-                break
-        services.append(svc)
+def _aware_stamp(value) -> bool:
+    if not isinstance(value, str) or "T" not in value or value != value.strip():
+        return False
+    try:
+        return datetime.fromisoformat(value).utcoffset() is not None
+    except ValueError:
+        return False
 
-    # An app CPE whose typical port wasn't in the port list still tells us the product —
-    # attach the first such unmatched app to the first productless service.
-    assigned = {s["port"] for s in services if s.get("product")}
-    for disp, ver, pports in apps:
-        if not any(p in assigned for p in pports):
-            for s in services:
-                if not s.get("product"):
-                    s["product"], s["version"] = disp, ver
-                    assigned.add(s["port"])
-                    break
 
-    # InternetDB vulns are host-level (not tied to a port). Attach them to the web
-    # service when there is one (most such CVEs are web-service CVEs), else the first
-    # product service, else the first service. cve.now then enriches them with real
-    # CVSS/KEV. The summary says it's host-level so nothing is misattributed silently.
-    if vulns and services:
-        web = next((s for s in services if s.get("product")
-                    and s["port"] in (80, 443, 8080, 8443)), None)
-        target = web or next((s for s in services if s.get("product")), services[0])
-        target["vulns"] = [{"cve": c, "severity": "", "source": "shodan-internetdb",
-                            "summary": "Host-level vulnerability reported by Shodan "
-                                       "InternetDB."}
-                           for c in vulns]
+def _ipv4_literal(value) -> bool:
+    if not isinstance(value, str):
+        return False
+    try:
+        ipaddress.IPv4Address(value)
+        return True
+    except ValueError:
+        return False
 
-    return {"ip": ip, "hostnames": hostnames, "tags": tags, "services": services}
+
+def normalize(ip: str, raw: dict, *, retrieved_at: str = "") -> dict | None:
+    """Normalize provider evidence with its known retrieval time, or fail closed.
+
+    ``retrieved_at`` must come from the fetch or its validated cache entry, not
+    from normalization time. The digest covers the entire unmodified raw JSON:
+    sorted keys, compact separators, ensure_ascii=False, allow_nan=False, UTF-8.
+    Unsupported CPE syntax remains in raw_payload, never a repaired assertion.
+    """
+    if (not _ipv4_literal(ip) or not _aware_stamp(retrieved_at)
+            or not isinstance(raw, dict) or raw.get("ip") != ip
+            or "detail" in raw or "error" in raw
+            or ("success" in raw and raw["success"] is not True)
+            or any(not isinstance(raw.get(key), list)
+                   for key in ("ports", "hostnames", "tags", "cpes", "vulns"))):
+        return None
+    ports = sorted({p for p in raw["ports"] if _is_port(p)})
+    if not ports:
+        return None
+    hostnames = [h for h in raw["hostnames"] if _text_token(h)][:12]
+    tags = [t for t in raw["tags"] if _text_token(t)][:16]
+    vulns = [c for c in raw["vulns"] if isinstance(c, str) and _CVE_RE.fullmatch(c)]
+
+    services = [
+        {"port": p, "transport": "unknown", "service": "",
+         "service_hint": SERVICE_NAMES.get(p, ""), "product": "", "version": "",
+         "os": "", "has_ssl": None, "vulns": [], "observed_at": None, "seen_at": ""}
+        for p in ports
+    ]
+    host_advisories = [
+        {"cve": c, "source": "shodan-internetdb", "scope": "host",
+         "service_attribution": "unknown", "assessment_state": "unverified"}
+        for c in vulns
+    ]
+
+    try:
+        canonical = json.dumps(raw, sort_keys=True, separators=(",", ":"),
+                               ensure_ascii=False, allow_nan=False)
+        payload_hash = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+    except (TypeError, ValueError):
+        return None
+    provenance = {
+        "kind": "import", "source": "shodan-internetdb",
+        "retrieved_at": retrieved_at, "reference": f"{BASE}/{ip}",
+        "payload_sha256": payload_hash,
+        "raw_payload": json.loads(canonical), "observed_at": None,
+        "host_cpes": [c for c in raw["cpes"] if _parse_cpe(c)[0]],
+        "host_advisories": host_advisories,
+    }
+    return {"ip": ip, "hostnames": hostnames, "tags": tags, "services": services,
+            "provenance": provenance}
 
 
 def _is_port(p) -> bool:
-    try:
-        return 1 <= int(p) <= 65535
-    except (TypeError, ValueError):
-        return False
+    return type(p) is int and 1 <= p <= 65535
 
 
 class InternetDB:
@@ -171,28 +158,37 @@ class InternetDB:
     def _stamp(self) -> str:
         if self._now:
             return self._now
-        from datetime import datetime, timezone
         return datetime.now(timezone.utc).isoformat()
 
     def _cached(self, ip: str):
         row = self.conn.execute(
-            "SELECT success, json FROM idb_cache WHERE ip=?", (ip,)).fetchone()
+            "SELECT success, json, fetched_at FROM idb_cache WHERE ip=?", (ip,)).fetchone()
         if row is None:
             return None
-        if not row["success"]:
+        if row["success"] == 0:
             return {"__absent__": True}
         try:
-            return json.loads(row["json"])
+            cached = json.loads(row["json"])
+            provenance = cached.get("provenance") if isinstance(cached, dict) else None
+            if (row["success"] != 1 or not isinstance(provenance, dict)
+                    or provenance.get("kind") != "import"
+                    or provenance.get("source") != "shodan-internetdb"
+                    or provenance.get("reference") != f"{BASE}/{ip}"
+                    or not _aware_stamp(provenance.get("retrieved_at"))
+                    or provenance["retrieved_at"] != row["fetched_at"]):
+                return None
+            # Re-normalize the evidence, never legacy/invented per-port claims.
+            doc = normalize(ip, provenance.get("raw_payload"),
+                            retrieved_at=provenance["retrieved_at"])
+            if doc and doc["provenance"]["payload_sha256"] == provenance.get("payload_sha256"):
+                return doc
         except (TypeError, ValueError):
-            return None
+            pass
+        return None
 
     def lookup(self, ip: str, *, allow_network: bool = True) -> dict | None:
         """Return a normalized host doc for ``ip`` (real data), or None. Cache-first."""
-        try:
-            addr = ipaddress.ip_address(ip)
-        except ValueError:
-            return None
-        if addr.version != 4:
+        if not _ipv4_literal(ip):
             return None
         cached = self._cached(ip)
         if cached is not None:
@@ -207,7 +203,9 @@ class InternetDB:
         if not isinstance(raw, dict) or "ports" not in raw:
             self._store_absent(ip)
             return None
-        doc = normalize(ip, raw)
+        doc = normalize(ip, raw, retrieved_at=self._stamp())
+        if doc is None:
+            return None
         self._store(ip, doc)
         return doc
 
@@ -216,7 +214,7 @@ class InternetDB:
             """INSERT INTO idb_cache(ip, success, json, fetched_at) VALUES(?,1,?,?)
                ON CONFLICT(ip) DO UPDATE SET success=1, json=excluded.json,
                    fetched_at=excluded.fetched_at""",
-            (ip, json.dumps(doc), self._stamp()))
+            (ip, json.dumps(doc), doc["provenance"]["retrieved_at"]))
         self.conn.commit()
 
     def _store_absent(self, ip: str) -> None:
@@ -252,22 +250,3 @@ class InternetDB:
             if on_result:
                 on_result(ip, doc, counts)
         return counts
-
-
-# A curated set of real, well-known public hosts to import for an instant real-data
-# demo (public resolvers across the world + scanme.nmap.org, which exists for scan tests).
-STARTER = [
-    "45.33.32.156",      # scanme.nmap.org — rich, meant for testing
-    "8.8.8.8", "8.8.4.4",          # Google
-    "1.1.1.1", "1.0.0.1",          # Cloudflare
-    "9.9.9.9",                     # Quad9
-    "208.67.222.222",              # OpenDNS (US)
-    "77.88.8.8",                   # Yandex (RU)
-    "94.140.14.14",                # AdGuard (CY)
-    "114.114.114.114",             # 114DNS (CN)
-    "80.80.80.80",                 # Freenom World
-    "185.228.168.9",               # CleanBrowsing
-    "156.154.70.1",                # Neustar/UltraDNS
-    "64.6.64.6",                   # UltraDNS
-    "4.2.2.2",                     # Level3
-]
