@@ -262,3 +262,14 @@ def test_summary_reports_scan_estimate(tmp_path):
     info = regions.parse(_scope_file(tmp_path), {"DE"}).summary()
     assert info["ipv4_addresses"] == 1024
     assert info["estimated_days_at_500cps"] == 0.0
+
+
+def test_parse_skips_unallocated_space(tmp_path):
+    from rennacs import regions
+    path = tmp_path / "d.txt"
+    path.write_text(
+        "ripencc|FR|ipv4|192.0.2.0|256|20200101|allocated\n"
+        "ripencc|FR|ipv4|198.51.100.0|256|20200101|available\n"
+        "ripencc|FR|ipv4|203.0.113.0|256|20200101|reserved\n", encoding="utf-8")
+    scope = regions.parse(path, {"FR"})
+    assert scope.ipv4_addresses == 256

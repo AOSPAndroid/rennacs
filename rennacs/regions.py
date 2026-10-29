@@ -32,8 +32,9 @@ EASTERN_EUROPE = frozenset({
 
 REGIONS = {"western": WESTERN_EUROPE, "eastern": EASTERN_EUROPE}
 
-# Statuses that mean "this block is actually delegated to someone".
-_LIVE = {"allocated", "assigned", "available", "reserved"}
+# Only these are worth scanning: "available"/"reserved" blocks have no holder yet, so
+# including them inflates the estimate and wastes packets on empty space.
+_LIVE = {"allocated", "assigned"}
 
 
 @dataclass
