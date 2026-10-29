@@ -25,3 +25,8 @@ env/
 Thumbs.db
 .idea/
 .vscode/
+
+# RIPE delegated stats cache
+ripe*.txt
+cdn-ranges.json
+*.db
