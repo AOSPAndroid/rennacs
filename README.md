@@ -6,6 +6,21 @@ authorized to scan, grabs service banners, fingerprints what's running, indexes 
 results in a local database, and gives you a Shodan-like web UI with a filter query
 language and per-host detail pages.
 
+## Passive vulnerability exposure tracking
+
+The `exposure` workflow tracks the disclosure-to-remediation window using official
+vendor advisories and explicitly allowlisted Shodan observations. It adds offline
+review at `/exposure`, advisory revisions, evidence timestamps, owner-backed
+decisions, filters and JSON/CSV audit exports. It makes no active scan requests.
+See [the exposure guide](docs/EXPOSURE.md) for scope/credential setup, supported
+sources, commands and limitations. Try it without credentials or networking:
+
+```bash
+python exposure_demo.py
+python cli.py --db exposure-demo.db web
+# http://127.0.0.1:5000/exposure — all demonstration records are synthetic
+```
+
 ## Multi-service foundation build
 
 The current development branch adds multi-service TCP profiles, an offline IPv4

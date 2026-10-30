@@ -25,3 +25,12 @@ env/
 Thumbs.db
 .idea/
 .vscode/
+
+# Credentials, customer authorization, passive evidence and audit exports
+.env
+.env.*
+!.env.example
+scope.json
+*.local.json
+evidence/
+exports/

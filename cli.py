@@ -680,6 +680,8 @@ def build_parser() -> argparse.ArgumentParser:
                    help="use only the geo cache, make no network calls")
     p.set_defaults(func=cmd_geo)
 
+    from rennacs.exposure.cli import register as register_exposure
+    register_exposure(sub)
     return ap
 
 

@@ -38,6 +38,8 @@ EXAMPLES = [
 def create_app(db_path: str | None = None) -> Flask:
     app = Flask(__name__)
     app.config["DB_PATH"] = db_path or os.environ.get("RENNACS_DB", "rennacs.db")
+    from .exposure.web import bp as exposure_bp
+    app.register_blueprint(exposure_bp)
 
     def index() -> Index:
         # One connection per request keeps SQLite happy across Flask's threads.

@@ -1,0 +1,53 @@
+{% extends "base.html" %}
+{% block title %}Passive exposure tracker · Rennacs{% endblock %}
+{% block body %}
+<h1>Disclosure → remediation</h1>
+<p>Passive evidence for an explicitly authorized engagement. Version matches require owner verification.</p>
+<p>Last assessment: {{ data.assessed_at or 'No assessment yet — see docs/EXPOSURE.md' }} ·
+  Reported: {{ data.reported_at }} · <a href="{{ url_for('exposure.api', **request.args) }}">JSON</a>
+  · <a href="{{ url_for('exposure.export', **request.args) }}">Export filtered CSV</a></p>
+<form method="get" style="display:flex;flex-wrap:wrap;gap:12px;margin:24px 0">
+  {% for key, label in [('vendor','Vendor'),('advisory_id','CVE'),('ip','IP'),('status','Status'),('match_kind','Match kind'),('max_disclosure_hours','Disclosure age ≤ hours'),('max_evidence_hours','Evidence age ≤ hours')] %}
+  <label>{{ label }}<input name="{{ key }}" value="{{ request.args.get(key,'') }}" style="display:block;max-width:190px"></label>
+  {% endfor %}<button type="submit">Filter</button><a href="/exposure">Reset</a>
+</form>
+<p>{{ data.findings|length }} findings · {{ data.advisories|length }} vendor advisories in the last assessment.
+  Missing results do not establish that an asset is secure.</p>
+{% for f in data.findings %}
+<article style="border:1px solid #425366;border-radius:12px;padding:20px;margin:18px 0">
+  <h2>{{ f.advisory_id }} · {{ f.ip }}:{{ f.port }}/{{ f.transport }}</h2>
+  <p><strong>Priority {{ f.priority }}</strong> · {{ f.status }} · {{ f.match_kind }} · {{ f.confirmation }}</p>
+  <p>{{ f.product or 'Unknown product' }} {{ f.version or 'Version unknown' }} · {{ f.title }}</p>
+  <p>Disclosure: {{ f.published_at }} ({{ f.disclosure_age_hours }} h ago)<br>
+    Latest observation: {{ f.observed_at }} ({{ f.evidence_age_hours }} h old)<br>
+    Ingested: {{ f.ingested_at }} · Assessed: {{ f.assessed_at }}</p>
+  {% if f.stale %}<p><strong>Stale observation — refresh passive evidence.</strong></p>{% endif %}
+  {% if f.pre_disclosure_evidence %}<p><strong>Observation predates disclosure.</strong></p>{% endif %}
+  {% if f.scope_expired %}<p><strong>Authorization expired — renew scope before further collection.</strong></p>{% endif %}
+  {% if f.review_after_decision %}<p><strong>New evidence after owner decision — review required.</strong></p>{% endif %}
+  {% if f.match_kind == 'not_reproduced' %}<p>The latest evidence does not reproduce the match. Remediation remains unverified.</p>{% endif %}
+  <p>Fix versions from reviewed rules: {{ f.fixed_versions|join(', ') or 'Verify vendor guidance' }}<br>
+    Authorization: {{ f.authorization.authorization_ref }} · expires {{ f.authorization.expires_at }}</p>
+  {% if f.disclosure_to_remediation_hours is not none %}<p>Owner-attested disclosure-to-remediation: {{ f.disclosure_to_remediation_hours }} hours.</p>{% endif %}
+  <details><summary>Evidence and history</summary><p>{{ f.limitation }}</p>
+    <p>{{ f.date_basis }} · advisory fetched {{ f.advisory_fetched_at }}</p>
+    <p><a href="{{ f.source_url }}" rel="noreferrer">Vendor source</a> ·
+      <a href="/api/exposure/{{ f.finding_id }}/history">Assessment and decision history</a> ·
+      <a href="/api/exposure/evidence/{{ f.evidence_hash }}">Raw observation</a> ·
+      <a href="/api/exposure/evidence/{{ f.advisory_revision }}">Advisory revision</a></p>
+    <pre style="white-space:pre-wrap;overflow-wrap:anywhere">Finding: {{ f.finding_id }}
+Evidence SHA-256: {{ f.evidence_hash }}
+Advisory revision: {{ f.advisory_revision }}
+Priority reasons: {{ f.priority_reasons|join('; ') }}
+Affected versions: {{ f.affected|tojson(indent=2) }}
+Decision: {{ f.decision|tojson(indent=2) }}</pre>
+  </details>
+</article>
+{% else %}<p>No matching findings. Import advisories and scoped observations, then run an offline assessment.</p>{% endfor %}
+<details><summary>Vendor advisory review queue</summary>
+  {% for a in data.advisories %}<p><a href="{{ a.source_url }}" rel="noreferrer">{{ a.id }} · {{ a.title }}</a>
+    — {{ a.vendor }} · {{ a.published_at }} · {{ a.affected_count }} affected product records
+    {% if a.requires_range_review %}· range review required{% endif %}</p>{% endfor %}
+</details>
+<details><summary>Recent acquisition runs</summary><pre style="white-space:pre-wrap">{{ data.recent_runs|tojson(indent=2) }}</pre></details>
+{% endblock %}
